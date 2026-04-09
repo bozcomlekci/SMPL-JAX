@@ -15,6 +15,32 @@ import jax.numpy as jnp
 
 
 # ---------------------------------------------------------------------------
+# shared normalisation primitive
+# ---------------------------------------------------------------------------
+
+def safe_normalize(
+    x: jnp.ndarray,
+    axis: int | tuple = -1,
+    eps: float = 1e-12,
+) -> jnp.ndarray:
+    """L2-normalise *x* along *axis* with a gradient-safe epsilon.
+
+    Unlike ``jnp.linalg.norm``, the gradient is finite everywhere including at
+    **x = 0** because the squared norm is shifted by *eps* before the sqrt:
+    ``x / sqrt(sum(x²) + eps)``.
+
+    Args:
+        x:    input array (any shape).
+        axis: axis or axes to reduce over (default: last axis).
+        eps:  small constant added inside the sqrt (default: 1e-12).
+
+    Returns:
+        Array with the same shape as *x*, unit-norm along *axis*.
+    """
+    return x / jnp.sqrt(jnp.sum(x * x, axis=axis, keepdims=True) + eps)
+
+
+# ---------------------------------------------------------------------------
 # axis-angle ↔ rotation matrix
 # ---------------------------------------------------------------------------
 
@@ -117,11 +143,8 @@ def rotation_6d_to_rotmat(r6d: jnp.ndarray) -> jnp.ndarray:
     a1 = r6d[..., :3]
     a2 = r6d[..., 3:]
 
-    # sqrt(sum²+ε) instead of linalg.norm: gradient is defined everywhere,
-    # including at zero (linalg.norm has 0/0 gradient at the origin).
-    b1 = a1 / jnp.sqrt(jnp.sum(a1 * a1, axis=-1, keepdims=True) + 1e-12)
-    b2 = a2 - jnp.sum(b1 * a2, axis=-1, keepdims=True) * b1
-    b2 = b2 / jnp.sqrt(jnp.sum(b2 * b2, axis=-1, keepdims=True) + 1e-12)
+    b1 = safe_normalize(a1)
+    b2 = safe_normalize(a2 - jnp.sum(b1 * a2, axis=-1, keepdims=True) * b1)
     b3 = jnp.cross(b1, b2)
 
     return jnp.stack([b1, b2, b3], axis=-1)

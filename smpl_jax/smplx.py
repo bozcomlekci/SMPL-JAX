@@ -7,9 +7,9 @@ Body from a Single Image", CVPR 2019.
 SMPL-X joint convention (55 total, indexed 0–54):
     0        pelvis            ← global_orient
     1–21     body joints       ← body_pose (63D = 21×3)
-    22       jaw               ← zero (not exposed in params)
-    23       left eye          ← zero
-    24       right eye         ← zero
+    22       jaw               ← identity (not exposed in params)
+    23       left eye          ← identity
+    24       right eye         ← identity
     25–39    left hand         ← left_hand_pose (45D = 15×3)
     40–54    right hand        ← right_hand_pose (45D = 15×3)
 """
@@ -23,18 +23,17 @@ import numpy as np
 from .types import SMPLXParams, SMPLXOutput
 from .model_io import load_model_data
 from .rotations import axis_angle_to_rotmat
-from .blend_shapes import shape_blend_shapes, expression_blend_shapes, pose_blend_shapes
-from .kinematics import fk_forward_batched
-from .lbs import lbs_transforms, lbs
+from .blend_shapes import expression_blend_shapes
+from ._base import _SMPLBase
 
 
 _NUM_BODY_JOINTS = 21
-_NUM_FACE_JOINTS = 3   # jaw, left eye, right eye
+_NUM_FACE_JOINTS = 3    # jaw, left eye, right eye (fixed at identity)
 _NUM_HAND_JOINTS = 15
 _SMPLX_JOINTS = 1 + _NUM_BODY_JOINTS + _NUM_FACE_JOINTS + 2 * _NUM_HAND_JOINTS  # 55
 
 
-class SMPLXModel:
+class SMPLXModel(_SMPLBase):
     """JAX port of SMPL-X.
 
     Model arrays are stored as JAX device arrays so they can be captured in
@@ -60,41 +59,39 @@ class SMPLXModel:
         # output.joints.shape   == (8, 55, 3)
     """
 
-    def __init__(
-        self,
-        v_template: np.ndarray,       # (V, 3)
-        shapedirs: np.ndarray,        # (V, 3, num_betas)
-        exprdirs: np.ndarray,         # (V, 3, num_expr)
-        posedirs: np.ndarray,         # (V*3, P)
-        J_regressor: np.ndarray,      # (J, V)  — J ≥ num_joints
-        parents: np.ndarray,          # (num_joints,)  int
-        weights: np.ndarray,          # (V, num_joints)
-        faces: np.ndarray,            # (F, 3)  int
-        num_betas: int = 10,
-        num_expression_coeffs: int = 10,
-    ) -> None:
-        self.num_joints = int(weights.shape[1])
-        self.num_betas = num_betas
-        self.num_expression_coeffs = num_expression_coeffs
-
-        # Store integer arrays as numpy for Python-level queries
-        self._parents_np = parents
-        self._faces_np = faces
-
-        # Device arrays — captured as constants inside jax.jit
-        self.v_template = jnp.array(v_template)
-        self.shapedirs = jnp.array(shapedirs[..., :num_betas])
-        self.exprdirs = jnp.array(exprdirs[..., :num_expression_coeffs])
-        self.posedirs = jnp.array(posedirs)
-        # Use the first num_joints rows of J_regressor for FK / LBS joints
-        self.J_regressor = jnp.array(J_regressor[:self.num_joints])
-        self.parents = jnp.array(parents)
-        self.weights = jnp.array(weights)
-        self.faces = jnp.array(faces)
+    _output_cls = SMPLXOutput
 
     # ------------------------------------------------------------------
     # construction
     # ------------------------------------------------------------------
+
+    def __init__(
+        self,
+        v_template: np.ndarray,
+        shapedirs: np.ndarray,
+        exprdirs: np.ndarray,          # (V, 3, num_expr)
+        posedirs: np.ndarray,
+        J_regressor: np.ndarray,
+        parents: np.ndarray,
+        weights: np.ndarray,
+        faces: np.ndarray,
+        num_betas: int = 10,
+        num_expression_coeffs: int = 10,
+    ) -> None:
+        super().__init__(
+            v_template=v_template,
+            shapedirs=shapedirs,
+            posedirs=posedirs,
+            J_regressor=J_regressor,
+            parents=parents,
+            weights=weights,
+            faces=faces,
+            num_betas=num_betas,
+        )
+        self.num_expression_coeffs = num_expression_coeffs
+        self.exprdirs = jnp.array(
+            exprdirs[..., :num_expression_coeffs], dtype=jnp.float32
+        )
 
     @classmethod
     def load(
@@ -130,87 +127,16 @@ class SMPLXModel:
         )
 
     # ------------------------------------------------------------------
-    # forward pass
+    # hooks
     # ------------------------------------------------------------------
 
-    def __call__(self, params: SMPLXParams) -> SMPLXOutput:
-        return self.forward(params)
+    def _vertex_blend_shapes(self, params: SMPLXParams) -> jnp.ndarray:
+        """Shape + expression blend shapes → (B, V, 3)."""
+        v_shaped = super()._vertex_blend_shapes(params)
+        return expression_blend_shapes(v_shaped, self.exprdirs, params.expression)
 
-    def forward(self, params: SMPLXParams) -> SMPLXOutput:
-        """SMPL-X forward pass.
-
-        Accepts both batched params (B, ...) and unbatched params (...).
-        Unbatched params are automatically handled, enabling jax.vmap(model).
-
-        Args:
-            params: SMPLXParams arrays shaped (B, ...) or (...) for single sample.
-
-        Returns:
-            SMPLXOutput with vertices/joints shaped (B, V, 3) / (B, J, 3),
-            or (V, 3) / (J, 3) when input was unbatched.
-        """
-        unbatched = params.betas.ndim == 1
-        if unbatched:
-            params = jax.tree_util.tree_map(lambda x: x[None], params)
-
-        B = params.betas.shape[0]
-
-        # 1. Shape blend shapes  →  (B, V, 3)
-        v_shaped = shape_blend_shapes(
-            self.v_template, self.shapedirs, params.betas
-        )
-
-        # 2. Expression blend shapes  →  (B, V, 3)
-        v_shaped = expression_blend_shapes(
-            v_shaped, self.exprdirs, params.expression
-        )
-
-        # 3. Regress bind-pose joint positions  →  (B, J, 3)
-        joints = jnp.einsum("jv,bvd->bjd", self.J_regressor, v_shaped)
-
-        # 4. Assemble rotation matrices for all joints  →  (B, J, 3, 3)
-        rotmats = self._assemble_rotmats(
-            params.global_orient,
-            params.body_pose,
-            params.left_hand_pose,
-            params.right_hand_pose,
-            B,
-        )
-
-        # 5. Forward kinematics  →  (B, J, 4, 4)
-        G = fk_forward_batched(rotmats, joints, self.parents)
-
-        # 6. Pose corrective blend shapes  →  (B, V, 3)
-        pose_corr = pose_blend_shapes(rotmats, self.posedirs)
-
-        # 7. Relative LBS transforms  →  (B, J, 4, 4)
-        M = lbs_transforms(G, joints)
-
-        # 8. Linear blend skinning  →  (B, V, 3)
-        vertices = lbs(v_shaped, pose_corr, M, self.weights)
-
-        # 9. Global translation
-        vertices = vertices + params.transl[:, None, :]
-        posed_joints = G[..., :3, 3] + params.transl[:, None, :]
-
-        out = SMPLXOutput(vertices=vertices, joints=posed_joints)
-        if unbatched:
-            out = SMPLXOutput(vertices=out.vertices[0], joints=out.joints[0])
-        return out
-
-    # ------------------------------------------------------------------
-    # internal helpers
-    # ------------------------------------------------------------------
-
-    def _assemble_rotmats(
-        self,
-        global_orient: jnp.ndarray,  # (B, 3)
-        body_pose: jnp.ndarray,      # (B, 63)
-        lhand_pose: jnp.ndarray,     # (B, 45)
-        rhand_pose: jnp.ndarray,     # (B, 45)
-        B: int,
-    ) -> jnp.ndarray:
-        """Assemble the full (B, J, 3, 3) rotation matrix array."""
+    def _build_rotmats(self, params: SMPLXParams, B: int) -> jnp.ndarray:
+        """Assemble (B, J, 3, 3) for the 55-joint SMPL-X skeleton."""
 
         def aa_block(aa_flat: jnp.ndarray, n: int) -> jnp.ndarray:
             """(B, n*3) → (B, n, 3, 3)"""
@@ -218,28 +144,28 @@ class SMPLXModel:
                 aa_flat.reshape(B, n, 3)
             )
 
-        R_root  = jax.vmap(axis_angle_to_rotmat)(global_orient)[:, None]   # (B,1,3,3)
-        R_body  = aa_block(body_pose, _NUM_BODY_JOINTS)                     # (B,21,3,3)
-        R_lhand = aa_block(lhand_pose, _NUM_HAND_JOINTS)                    # (B,15,3,3)
-        R_rhand = aa_block(rhand_pose, _NUM_HAND_JOINTS)                    # (B,15,3,3)
+        R_root  = jax.vmap(axis_angle_to_rotmat)(params.global_orient)[:, None]  # (B,1,3,3)
+        R_body  = aa_block(params.body_pose,       _NUM_BODY_JOINTS)              # (B,21,3,3)
+        R_lhand = aa_block(params.left_hand_pose,  _NUM_HAND_JOINTS)              # (B,15,3,3)
+        R_rhand = aa_block(params.right_hand_pose, _NUM_HAND_JOINTS)              # (B,15,3,3)
 
-        # Face joints (jaw, left-eye, right-eye) → identity rotation
+        # Face joints (jaw, left-eye, right-eye) → identity rotation.
+        # These are not exposed as input parameters in the base SMPL-X model.
         I_face = jnp.broadcast_to(
-            jnp.eye(3)[None, None],
+            jnp.eye(3, dtype=jnp.float32)[None, None],
             (B, _NUM_FACE_JOINTS, 3, 3),
         )
 
-        # Concatenate in joint order: 0(root), 1-21(body), 22-24(face),
-        # 25-39(left hand), 40-54(right hand)
+        # Joint order: root(0), body(1-21), face(22-24), lhand(25-39), rhand(40-54)
         R_all = jnp.concatenate(
             [R_root, R_body, I_face, R_lhand, R_rhand], axis=1
         )                                                           # (B, ≤55, 3, 3)
 
+        # Trim or pad to match the model's actual joint count
         J = self.num_joints
         if R_all.shape[1] < J:
-            # Pad extra joints with identity
             pad = jnp.broadcast_to(
-                jnp.eye(3)[None, None],
+                jnp.eye(3, dtype=jnp.float32)[None, None],
                 (B, J - R_all.shape[1], 3, 3),
             )
             R_all = jnp.concatenate([R_all, pad], axis=1)

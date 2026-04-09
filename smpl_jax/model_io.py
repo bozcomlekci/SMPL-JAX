@@ -53,6 +53,11 @@ def load_model_data(path: str) -> dict:
         posedirs = posedirs_raw                                     # already (V*3, P)
     else:
         # Likely (P, V*3) — transpose to (V*3, P)
+        if posedirs_raw.ndim != 2:
+            raise ValueError(
+                f"Cannot interpret posedirs shape {posedirs_raw.shape}: "
+                "expected a 2-D array in (V*3, P) or (P, V*3) layout."
+            )
         posedirs = posedirs_raw.T
 
     # ---- J_regressor --------------------------------------------------

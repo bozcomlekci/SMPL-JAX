@@ -19,7 +19,7 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from .rotations import rotation_6d_to_rotmat, rotmat_to_6d
+from .rotations import rotation_6d_to_rotmat, rotmat_to_6d, safe_normalize
 from .kinematics import fk_forward
 from .lbs import lbs_transforms, lbs
 
@@ -40,8 +40,7 @@ def _newton_schulz(A: jnp.ndarray, num_iter: int = 10) -> jnp.ndarray:
     Returns:
         (3, 3) orthogonal matrix (det ≈ ±1).
     """
-    # sqrt(sum²+ε) keeps the gradient finite everywhere (linalg.norm has 0/0 at zero)
-    X = A / jnp.sqrt(jnp.sum(A * A, axis=(-2, -1), keepdims=True) + 1e-12)
+    X = safe_normalize(A, axis=(-2, -1))
     I = jnp.eye(3, dtype=A.dtype)
 
     def step(X: jnp.ndarray, _: None):
@@ -79,7 +78,7 @@ def analytical_init(
 
     def per_joint(j: jnp.ndarray) -> jnp.ndarray:
         w = weights[:, j]                                          # (V,)
-        w_norm = w / (w.sum() + 1e-8)
+        w_norm = w / jnp.maximum(w.sum(), 1e-8)
 
         c_bind  = jnp.einsum("v,vd->d", w_norm, v_template)       # (3,)
         c_posed = jnp.einsum("v,vd->d", w_norm, posed_verts)      # (3,)

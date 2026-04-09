@@ -30,6 +30,7 @@ from .rotations import (
     rotmat_to_axis_angle,
     rotmat_to_6d,
     rotation_6d_to_rotmat,
+    safe_normalize,
 )
 
 __all__ = [
@@ -48,4 +49,5 @@ __all__ = [
     "rotmat_to_axis_angle",
     "rotmat_to_6d",
     "rotation_6d_to_rotmat",
+    "safe_normalize",
 ]

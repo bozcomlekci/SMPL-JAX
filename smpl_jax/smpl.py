@@ -12,20 +12,14 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 
 from .types import SMPLParams, SMPLOutput
 from .model_io import load_model_data
 from .rotations import axis_angle_to_rotmat
-from .blend_shapes import shape_blend_shapes, pose_blend_shapes
-from .kinematics import fk_forward_batched
-from .lbs import lbs_transforms, lbs
+from ._base import _SMPLBase
 
 
-_NUM_BODY_JOINTS = 23   # joints 1–23; joint 0 is the root (global_orient)
-
-
-class SMPLModel:
+class SMPLModel(_SMPLBase):
     """JAX port of SMPL.
 
     Usage::
@@ -45,30 +39,7 @@ class SMPLModel:
         # output.joints.shape   == (8, 24, 3)
     """
 
-    def __init__(
-        self,
-        v_template: np.ndarray,    # (V, 3)
-        shapedirs: np.ndarray,     # (V, 3, num_betas)
-        posedirs: np.ndarray,      # (V*3, P)
-        J_regressor: np.ndarray,   # (J, V)
-        parents: np.ndarray,       # (J,)  int
-        weights: np.ndarray,       # (V, J)
-        faces: np.ndarray,         # (F, 3)  int
-        num_betas: int = 10,
-    ) -> None:
-        self.num_joints = int(weights.shape[1])
-        self.num_betas = num_betas
-
-        self._parents_np = parents
-        self._faces_np = faces
-
-        self.v_template = jnp.array(v_template)
-        self.shapedirs = jnp.array(shapedirs[..., :num_betas])
-        self.posedirs = jnp.array(posedirs)
-        self.J_regressor = jnp.array(J_regressor)
-        self.parents = jnp.array(parents)
-        self.weights = jnp.array(weights)
-        self.faces = jnp.array(faces)
+    _output_cls = SMPLOutput
 
     # ------------------------------------------------------------------
     # construction
@@ -90,64 +61,14 @@ class SMPLModel:
         )
 
     # ------------------------------------------------------------------
-    # forward pass
+    # hook: rotation assembly
     # ------------------------------------------------------------------
 
-    def __call__(self, params: SMPLParams) -> SMPLOutput:
-        return self.forward(params)
-
-    def forward(self, params: SMPLParams) -> SMPLOutput:
-        """SMPL forward pass.
-
-        Accepts both batched params (B, ...) and unbatched params (...).
-        Unbatched params are automatically handled, enabling jax.vmap(model).
-
-        Args:
-            params: SMPLParams arrays shaped (B, ...) or (...) for single sample.
-
-        Returns:
-            SMPLOutput with vertices/joints shaped (B, V, 3) / (B, J, 3),
-            or (V, 3) / (J, 3) when input was unbatched.
-        """
-        unbatched = params.betas.ndim == 1
-        if unbatched:
-            params = jax.tree_util.tree_map(lambda x: x[None], params)
-
-        B = params.betas.shape[0]
-
-        # 1. Shape blend shapes  →  (B, V, 3)
-        v_shaped = shape_blend_shapes(
-            self.v_template, self.shapedirs, params.betas
-        )
-
-        # 2. Regress bind-pose joint positions  →  (B, J, 3)
-        joints = jnp.einsum("jv,bvd->bjd", self.J_regressor, v_shaped)
-
-        # 3. Rotation matrices for all joints  →  (B, J, 3, 3)
-        n_body = self.num_joints - 1                                # e.g. 23 for full SMPL
+    def _build_rotmats(self, params: SMPLParams, B: int) -> jnp.ndarray:
+        """Assemble (B, J, 3, 3) from global_orient + body_pose."""
+        n_body = self.num_joints - 1                                # dynamic, typically 23
         R_root = jax.vmap(axis_angle_to_rotmat)(params.global_orient)[:, None]
         R_body = jax.vmap(jax.vmap(axis_angle_to_rotmat))(
             params.body_pose.reshape(B, n_body, 3)
         )
-        rotmats = jnp.concatenate([R_root, R_body], axis=1)        # (B, J, 3, 3)
-
-        # 4. Forward kinematics  →  (B, J, 4, 4)
-        G = fk_forward_batched(rotmats, joints, self.parents)
-
-        # 5. Pose corrective blend shapes  →  (B, V, 3)
-        pose_corr = pose_blend_shapes(rotmats, self.posedirs)
-
-        # 6. Relative LBS transforms  →  (B, J, 4, 4)
-        M = lbs_transforms(G, joints)
-
-        # 7. Linear blend skinning  →  (B, V, 3)
-        vertices = lbs(v_shaped, pose_corr, M, self.weights)
-
-        # 8. Global translation
-        vertices = vertices + params.transl[:, None, :]
-        posed_joints = G[..., :3, 3] + params.transl[:, None, :]
-
-        out = SMPLOutput(vertices=vertices, joints=posed_joints)
-        if unbatched:
-            out = SMPLOutput(vertices=out.vertices[0], joints=out.joints[0])
-        return out
+        return jnp.concatenate([R_root, R_body], axis=1)           # (B, J, 3, 3)
