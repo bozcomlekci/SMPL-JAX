@@ -40,7 +40,8 @@ def _newton_schulz(A: jnp.ndarray, num_iter: int = 10) -> jnp.ndarray:
     Returns:
         (3, 3) orthogonal matrix (det ≈ ±1).
     """
-    X = A / (jnp.linalg.norm(A, axis=(-2, -1), keepdims=True) + 1e-8)
+    # sqrt(sum²+ε) keeps the gradient finite everywhere (linalg.norm has 0/0 at zero)
+    X = A / jnp.sqrt(jnp.sum(A * A, axis=(-2, -1), keepdims=True) + 1e-12)
     I = jnp.eye(3, dtype=A.dtype)
 
     def step(X: jnp.ndarray, _: None):
@@ -133,7 +134,7 @@ def autograd_refine(
     def forward_from_6d(r6d: jnp.ndarray) -> jnp.ndarray:
         R = jax.vmap(rotation_6d_to_rotmat)(r6d)                  # (J, 3, 3)
         G = fk_forward(R, joints, parents)                         # (J, 4, 4)
-        M = lbs_transforms(G[None], joints[None])                  # (1, J, 4, 4)
+        M = lbs_transforms(G[None], joints[None])                  # (1, J, 3, 4)
         v_posed = lbs(
             v_template[None],
             jnp.zeros_like(v_template[None]),

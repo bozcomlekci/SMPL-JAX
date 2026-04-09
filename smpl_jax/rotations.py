@@ -117,9 +117,11 @@ def rotation_6d_to_rotmat(r6d: jnp.ndarray) -> jnp.ndarray:
     a1 = r6d[..., :3]
     a2 = r6d[..., 3:]
 
-    b1 = a1 / (jnp.linalg.norm(a1, axis=-1, keepdims=True) + 1e-8)
+    # sqrt(sum²+ε) instead of linalg.norm: gradient is defined everywhere,
+    # including at zero (linalg.norm has 0/0 gradient at the origin).
+    b1 = a1 / jnp.sqrt(jnp.sum(a1 * a1, axis=-1, keepdims=True) + 1e-12)
     b2 = a2 - jnp.sum(b1 * a2, axis=-1, keepdims=True) * b1
-    b2 = b2 / (jnp.linalg.norm(b2, axis=-1, keepdims=True) + 1e-8)
+    b2 = b2 / jnp.sqrt(jnp.sum(b2 * b2, axis=-1, keepdims=True) + 1e-12)
     b3 = jnp.cross(b1, b2)
 
     return jnp.stack([b1, b2, b3], axis=-1)
