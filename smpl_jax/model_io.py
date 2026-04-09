@@ -72,7 +72,9 @@ def load_model_data(path: str) -> dict:
     faces = np.array(get("f"), dtype=np.int32)                     # (F, 3)
 
     # ---- expression blend shapes (SMPL-X only) ------------------------
-    exprdirs_raw = get("expr_dirs") or get("exprdirs")
+    exprdirs_raw = get("expr_dirs")
+    if exprdirs_raw is None:
+        exprdirs_raw = get("exprdirs")
     exprdirs: np.ndarray | None = None
     if exprdirs_raw is not None:
         exprdirs = np.array(exprdirs_raw, dtype=np.float32)

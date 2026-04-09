@@ -139,14 +139,20 @@ class SMPLXModel:
     def forward(self, params: SMPLXParams) -> SMPLXOutput:
         """SMPL-X forward pass.
 
+        Accepts both batched params (B, ...) and unbatched params (...).
+        Unbatched params are automatically handled, enabling jax.vmap(model).
+
         Args:
-            params: SMPLXParams with (B, ...) batched arrays.
+            params: SMPLXParams arrays shaped (B, ...) or (...) for single sample.
 
         Returns:
-            SMPLXOutput with
-                vertices (B, V, 3) and
-                joints   (B, num_joints, 3).
+            SMPLXOutput with vertices/joints shaped (B, V, 3) / (B, J, 3),
+            or (V, 3) / (J, 3) when input was unbatched.
         """
+        unbatched = params.betas.ndim == 1
+        if unbatched:
+            params = jax.tree_util.tree_map(lambda x: x[None], params)
+
         B = params.betas.shape[0]
 
         # 1. Shape blend shapes  →  (B, V, 3)
@@ -187,7 +193,10 @@ class SMPLXModel:
         vertices = vertices + params.transl[:, None, :]
         posed_joints = G[..., :3, 3] + params.transl[:, None, :]
 
-        return SMPLXOutput(vertices=vertices, joints=posed_joints)
+        out = SMPLXOutput(vertices=vertices, joints=posed_joints)
+        if unbatched:
+            out = SMPLXOutput(vertices=out.vertices[0], joints=out.joints[0])
+        return out
 
     # ------------------------------------------------------------------
     # internal helpers
