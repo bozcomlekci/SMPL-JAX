@@ -1,0 +1,563 @@
+diff --git a/include/smplx/smplx.hpp b/include/smplx/smplx.hpp
+index 0aa362d..9333fdc 100644
+--- a/include/smplx/smplx.hpp
++++ b/include/smplx/smplx.hpp
+@@ -228,6 +228,11 @@ class Body {
+     //                          of worse accuracy
+     void update(bool force_cpu = false, bool enable_pose_blendshapes = true);
+ 
++    // Stream-aware update path used by fused batched inference.
++    // `cuda_stream` is ignored on CPU.
++    void update_cuda_stream(bool force_cpu, bool enable_pose_blendshapes,
++                            void* cuda_stream);
++
+     // Save as obj file
+     void save_obj(const std::string& path) const;
+ 
+@@ -280,10 +285,10 @@ class Body {
+     vert_transforms() const;
+ 
+     // Set parameters to zero
+-    inline void set_zero() { params.setZero(); }
++    SMPLX_HOST inline void set_zero() { params.setZero(); }
+ 
+     // Set parameters uar in [-0.25, 0.25]
+-    inline void set_random() { params.setRandom() * 0.25; }
++    SMPLX_HOST inline void set_random() { params.setRandom() * 0.25f; }
+ 
+     // The SMPL model used
+     const Model<ModelConfig>& model;
+@@ -350,7 +355,8 @@ class Body {
+     void _cuda_maybe_retrieve_verts() const;
+     void _cuda_maybe_retrieve_verts_shaped() const;
+     void _cuda_update(float* h_blendshape_params, float* h_joint_transforms,
+-                      bool enable_pose_blendshapes = true);
++                      bool enable_pose_blendshapes = true,
++                      void* cuda_stream = nullptr);
+ #endif
+ };
+ // SMPL Body
+diff --git a/pybind.cpp b/pybind.cpp
+index f6d8a81..1160a4a 100644
+--- a/pybind.cpp
++++ b/pybind.cpp
+@@ -2,13 +2,23 @@
+ #include <pybind11/numpy.h>
+ #include <pybind11/eigen.h>
+ #include <pybind11/stl.h>
++#include <algorithm>
++#include <cstring>
+ #include <iostream>
++#include <memory>
+ #include <string>
++#include <thread>
++#include <utility>
++#include <vector>
+ 
+ #include <smplx/smplx.hpp>
+ #include <smplx/sequence.hpp>
+ #include <smplx/util.hpp>
+ 
++#ifdef SMPLX_CUDA_ENABLED
++#include <cuda_runtime_api.h>
++#endif
++
+ namespace py = pybind11;
+ using namespace smplx;
+ 
+@@ -21,6 +31,305 @@ const bool CUDA_AVAILABLE =
+ #endif
+     ;
+ 
++template <class ModelConfig>
++class FusedBatchForward {
++   public:
++    using ModelClass = Model<ModelConfig>;
++    using BodyClass = Body<ModelConfig>;
++
++    FusedBatchForward(py::object model_owner, size_t batch_capacity)
++        : model_owner_(std::move(model_owner)),
++          model_(&model_owner_.cast<ModelClass&>()),
++          n_pose_params_(ModelConfig::n_explicit_joints() * 3),
++          n_shape_blends_(ModelConfig::n_shape_blends()),
++          n_verts_(model_->n_verts()) {
++        if (batch_capacity == 0) {
++            throw std::invalid_argument("batch_capacity must be > 0");
++        }
++        bodies_.reserve(batch_capacity);
++        for (size_t i = 0; i < batch_capacity; ++i) {
++            bodies_.emplace_back(new BodyClass(*model_));
++        }
++
++#ifdef SMPLX_CUDA_ENABLED
++        cuda_streams_.assign(batch_capacity, nullptr);
++        for (size_t i = 0; i < batch_capacity; ++i) {
++            cudaStream_t stream = nullptr;
++            if (cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) ==
++                cudaSuccess) {
++                cuda_streams_[i] = reinterpret_cast<void*>(stream);
++            }
++        }
++#endif
++    }
++
++    FusedBatchForward(const FusedBatchForward&) = delete;
++    FusedBatchForward& operator=(const FusedBatchForward&) = delete;
++    FusedBatchForward(FusedBatchForward&&) noexcept = default;
++    FusedBatchForward& operator=(FusedBatchForward&&) noexcept = default;
++
++    ~FusedBatchForward() {
++#ifdef SMPLX_CUDA_ENABLED
++        for (void* stream_handle : cuda_streams_) {
++            if (stream_handle != nullptr) {
++                cudaStreamDestroy(
++                    reinterpret_cast<cudaStream_t>(stream_handle));
++            }
++        }
++#endif
++    }
++
++    size_t batch_capacity() const { return bodies_.size(); }
++
++    void set_betas(py::array_t<float, py::array::c_style | py::array::forcecast>
++                       betas) {
++        const auto info = betas.request();
++        if (info.ndim != 1 && info.ndim != 2) {
++            throw std::invalid_argument(
++                "betas must have shape (n_shape_blends,) or "
++                "(batch_capacity, n_shape_blends)");
++        }
++
++        const auto* beta_ptr = static_cast<const float*>(info.ptr);
++        if (info.ndim == 1) {
++            const size_t src_n = static_cast<size_t>(info.shape[0]);
++            const size_t copy_n = std::min(src_n, n_shape_blends_);
++            for (auto& body_ptr : bodies_) {
++                auto shape = body_ptr->shape();
++                shape.setZero();
++                if (copy_n > 0) {
++                    std::memcpy(shape.data(), beta_ptr, copy_n * sizeof(float));
++                }
++            }
++            return;
++        }
++
++        const size_t row_n = static_cast<size_t>(info.shape[0]);
++        const size_t col_n = static_cast<size_t>(info.shape[1]);
++        if (row_n != bodies_.size()) {
++            throw std::invalid_argument(
++                "2D betas first dimension must equal batch_capacity");
++        }
++        const size_t copy_n = std::min(col_n, n_shape_blends_);
++        for (size_t i = 0; i < bodies_.size(); ++i) {
++            auto shape = bodies_[i]->shape();
++            shape.setZero();
++            if (copy_n > 0) {
++                std::memcpy(shape.data(), beta_ptr + i * col_n,
++                            copy_n * sizeof(float));
++            }
++        }
++    }
++
++    void update(
++        py::array_t<float, py::array::c_style | py::array::forcecast> trans,
++        py::array_t<float, py::array::c_style | py::array::forcecast> pose,
++        bool force_cpu = false, bool enable_pose_blendshapes = true) {
++        (void)run_batch(trans, pose, force_cpu, enable_pose_blendshapes,
++                        OutputMode::kNone);
++    }
++
++    py::array_t<float> forward_last(
++        py::array_t<float, py::array::c_style | py::array::forcecast> trans,
++        py::array_t<float, py::array::c_style | py::array::forcecast> pose,
++        bool force_cpu = false, bool enable_pose_blendshapes = true) {
++        return run_batch(trans, pose, force_cpu, enable_pose_blendshapes,
++                         OutputMode::kLast)
++            .template cast<py::array_t<float>>();
++    }
++
++    py::array_t<float> forward(
++        py::array_t<float, py::array::c_style | py::array::forcecast> trans,
++        py::array_t<float, py::array::c_style | py::array::forcecast> pose,
++        bool force_cpu = false, bool enable_pose_blendshapes = true) {
++        return run_batch(trans, pose, force_cpu, enable_pose_blendshapes,
++                         OutputMode::kFull)
++            .template cast<py::array_t<float>>();
++    }
++
++   private:
++    enum class OutputMode { kNone, kLast, kFull };
++
++    bool can_use_cuda_parallel(size_t batch_n, bool force_cpu) const {
++#ifdef SMPLX_CUDA_ENABLED
++        if (force_cpu || !CUDA_AVAILABLE || batch_n <= 1) {
++            return false;
++        }
++        if (cuda_streams_.size() < batch_n) {
++            return false;
++        }
++        return std::all_of(cuda_streams_.begin(),
++                           cuda_streams_.begin() +
++                               static_cast<std::ptrdiff_t>(batch_n),
++                           [](void* stream_handle) {
++                               return stream_handle != nullptr;
++                           });
++#else
++        (void)batch_n;
++        (void)force_cpu;
++        return false;
++#endif
++    }
++
++    void synchronize_cuda_streams(size_t batch_n) const {
++#ifdef SMPLX_CUDA_ENABLED
++        const size_t n = std::min(batch_n, cuda_streams_.size());
++        for (size_t i = 0; i < n; ++i) {
++            if (cuda_streams_[i] != nullptr) {
++                cudaStreamSynchronize(
++                    reinterpret_cast<cudaStream_t>(cuda_streams_[i]));
++            }
++        }
++#else
++        (void)batch_n;
++#endif
++    }
++
++    py::object run_batch(
++        py::array_t<float, py::array::c_style | py::array::forcecast> trans,
++        py::array_t<float, py::array::c_style | py::array::forcecast> pose,
++        bool force_cpu, bool enable_pose_blendshapes, OutputMode output_mode) {
++        const auto trans_info = trans.request();
++        const auto pose_info = pose.request();
++        if (trans_info.ndim != 2 || trans_info.shape[1] != 3) {
++            throw std::invalid_argument("trans must have shape (batch, 3)");
++        }
++        if (pose_info.ndim != 2 ||
++            pose_info.shape[1] != static_cast<py::ssize_t>(n_pose_params_)) {
++            throw std::invalid_argument(
++                "pose must have shape (batch, n_pose_params)");
++        }
++        if (trans_info.shape[0] != pose_info.shape[0]) {
++            throw std::invalid_argument(
++                "trans and pose must have the same batch dimension");
++        }
++
++        const size_t batch_n = static_cast<size_t>(trans_info.shape[0]);
++        if (batch_n == 0) {
++            throw std::invalid_argument("batch must be non-empty");
++        }
++        if (batch_n > bodies_.size()) {
++            throw std::invalid_argument(
++                "batch exceeds batch_capacity of this fused runner");
++        }
++
++        const auto* trans_ptr = static_cast<const float*>(trans_info.ptr);
++        const auto* pose_ptr = static_cast<const float*>(pose_info.ptr);
++
++        py::array_t<float> output;
++        float* out_ptr = nullptr;
++        if (output_mode == OutputMode::kFull) {
++            output = py::array_t<float>(
++                {static_cast<py::ssize_t>(batch_n),
++                 static_cast<py::ssize_t>(n_verts_), static_cast<py::ssize_t>(3)});
++            out_ptr = output.mutable_data();
++        } else if (output_mode == OutputMode::kLast) {
++            output = py::array_t<float>(
++                {static_cast<py::ssize_t>(n_verts_), static_cast<py::ssize_t>(3)});
++            out_ptr = output.mutable_data();
++        }
++
++        const bool use_cuda_parallel = can_use_cuda_parallel(batch_n, force_cpu);
++
++        {
++            py::gil_scoped_release release;
++            if (use_cuda_parallel) {
++                std::vector<std::thread> workers;
++                workers.reserve(batch_n);
++                for (size_t i = 0; i < batch_n; ++i) {
++                    workers.emplace_back([&, i]() {
++                        auto& body = *bodies_[i];
++                        std::memcpy(body.trans().data(), trans_ptr + i * 3,
++                                    3 * sizeof(float));
++                        std::memcpy(
++                            body.pose().data(), pose_ptr + i * n_pose_params_,
++                            n_pose_params_ * sizeof(float));
++                        body.update_cuda_stream(
++                            force_cpu, enable_pose_blendshapes,
++                            cuda_streams_[i]);
++                    });
++                }
++                for (auto& worker : workers) {
++                    worker.join();
++                }
++                synchronize_cuda_streams(batch_n);
++            } else {
++                for (size_t i = 0; i < batch_n; ++i) {
++                    auto& body = *bodies_[i];
++                    std::memcpy(body.trans().data(), trans_ptr + i * 3,
++                                3 * sizeof(float));
++                    std::memcpy(
++                        body.pose().data(), pose_ptr + i * n_pose_params_,
++                        n_pose_params_ * sizeof(float));
++                    body.update(force_cpu, enable_pose_blendshapes);
++                }
++            }
++
++            if (output_mode == OutputMode::kFull) {
++                for (size_t i = 0; i < batch_n; ++i) {
++                    const auto& verts = bodies_[i]->verts();
++                    std::memcpy(out_ptr + i * n_verts_ * 3, verts.data(),
++                                n_verts_ * 3 * sizeof(float));
++                }
++            } else if (output_mode == OutputMode::kLast) {
++                const auto& verts = bodies_[batch_n - 1]->verts();
++                std::memcpy(out_ptr, verts.data(),
++                            n_verts_ * 3 * sizeof(float));
++            }
++        }
++
++        if (output_mode == OutputMode::kNone) {
++            return py::none();
++        }
++        return std::move(output);
++    }
++
++    py::object model_owner_;
++    const ModelClass* model_;
++    size_t n_pose_params_;
++    size_t n_shape_blends_;
++    size_t n_verts_;
++    std::vector<std::unique_ptr<BodyClass>> bodies_;
++    std::vector<void*> cuda_streams_;
++};
++
++template <class ModelConfig>
++void declare_fused_batch_forward(py::module& m,
++                                 const std::string& py_batch_name) {
++    using FusedBatchForwardClass = FusedBatchForward<ModelConfig>;
++    using ModelClass = Model<ModelConfig>;
++
++    py::class_<FusedBatchForwardClass>(m, py_batch_name.c_str())
++        .def(py::init([](py::object model, size_t batch_capacity) {
++                 model.cast<ModelClass&>();
++                 return FusedBatchForwardClass(std::move(model),
++                                               batch_capacity);
++             }),
++             py::arg("model"), py::arg("batch_capacity"),
++             "Create a fused batch-forward runner bound to a model instance.")
++        .def_property_readonly(
++            "batch_capacity", &FusedBatchForwardClass::batch_capacity,
++            "Maximum batch size accepted by this runner")
++        .def("set_betas", &FusedBatchForwardClass::set_betas,
++             py::arg("betas"),
++             "Set shape parameters. Accepts (n_shape_blends,) or "
++             "(batch_capacity, n_shape_blends).")
++        .def("update", &FusedBatchForwardClass::update, py::arg("trans"),
++             py::arg("pose"), py::arg("force_cpu") = false,
++             py::arg("enable_pose_blendshapes") = true,
++             "Run fused batched updates without returning vertices.")
++        .def("forward_last", &FusedBatchForwardClass::forward_last,
++             py::arg("trans"), py::arg("pose"), py::arg("force_cpu") = false,
++             py::arg("enable_pose_blendshapes") = true,
++             "Run fused batched forward and return vertices for the last row "
++             "(n_verts, 3).")
++        .def("forward", &FusedBatchForwardClass::forward, py::arg("trans"),
++             py::arg("pose"), py::arg("force_cpu") = false,
++             py::arg("enable_pose_blendshapes") = true,
++             "Run fused batched forward and return vertices for all rows "
++             "(batch, n_verts, 3).");
++}
++
+ template <class ModelConfig>
+ void declare_model(py::module& m, const std::string& py_model_name,
+                    const std::string& py_body_name) {
+@@ -383,6 +692,8 @@ PYBIND11_MODULE(smplxpp, m) {
+     declare_model<model_config::SMPLH>(m, "ModelH", "BodyH");
+     declare_model<model_config::SMPLX>(m, "ModelX", "BodyX");
+     declare_model<model_config::SMPLXpca>(m, "ModelXpca", "BodyXpca");
++    declare_fused_batch_forward<model_config::SMPL>(m, "FusedBatchForwardS");
++    declare_fused_batch_forward<model_config::SMPLX>(m, "FusedBatchForwardX");
+ 
+     declare_sequence<sequence_config::AMASS>(m, "SequenceAMASS");
+ 
+diff --git a/setup.py b/setup.py
+index e1afef8..683ee34 100644
+--- a/setup.py
++++ b/setup.py
+@@ -40,10 +40,14 @@ class CMakeBuild(build_ext):
+         if not extdir.endswith(os.path.sep):
+             extdir += os.path.sep
+ 
++        use_cuda_env = os.environ.get('SMPLXPP_USE_CUDA', 'ON').strip().upper()
++        use_cuda = 'ON' if use_cuda_env in ('1', 'ON', 'TRUE', 'YES') else 'OFF'
++
+         cmake_args = [
+             '-DCMAKE_LIBRARY_OUTPUT_DIRECTORY=' + extdir,
+             '-DPYTHON_EXECUTABLE=' + sys.executable, '-DSMPLX_BUILD_PYTHON=ON',
+-            '-DSMPLX_BUILD_VIEWER=OFF'
++            '-DSMPLX_BUILD_VIEWER=OFF',
++            '-DSMPLX_USE_CUDA=' + use_cuda,
+         ]
+ 
+         cfg = 'Debug' if self.debug else 'Release'
+diff --git a/src/body.cpp b/src/body.cpp
+index 8ff4d03..aa5365b 100644
+--- a/src/body.cpp
++++ b/src/body.cpp
+@@ -74,6 +74,14 @@ Body<ModelConfig>::vert_transforms() const {
+ // Main LBS routine
+ template <class ModelConfig>
+ void Body<ModelConfig>::update(bool force_cpu, bool enable_pose_blendshapes) {
++    update_cuda_stream(force_cpu, enable_pose_blendshapes, nullptr);
++}
++
++// Main LBS routine with optional CUDA stream.
++template <class ModelConfig>
++void Body<ModelConfig>::update_cuda_stream(bool force_cpu,
++                                           bool enable_pose_blendshapes,
++                                           void* cuda_stream) {
+     // _SMPLX_BEGIN_PROFILE;
+     // Will store full pose params (angle-axis), including hand
+     Vector full_pose(3 * model.n_joints());
+@@ -121,7 +129,7 @@ void Body<ModelConfig>::update(bool force_cpu, bool enable_pose_blendshapes) {
+     _last_update_used_gpu = !force_cpu;
+     if (!force_cpu) {
+         _cuda_update(blendshape_params.data(), _joint_transforms.data(),
+-                     enable_pose_blendshapes);
++                     enable_pose_blendshapes, cuda_stream);
+         _vert_transforms.resize(0, 12);
+         return;
+     }
+diff --git a/src/cuda/body.cu b/src/cuda/body.cu
+index 5914c0c..17b542b 100644
+--- a/src/cuda/body.cu
++++ b/src/cuda/body.cu
+@@ -174,7 +174,10 @@ template<class ModelConfig>
+ SMPLX_HOST void Body<ModelConfig>::_cuda_update(
+         float* h_blendshape_params,
+         float* h_joint_transforms,
+-        bool enable_pose_blendshapes) {
++        bool enable_pose_blendshapes,
++        void* cuda_stream) {
++    cudaStream_t stream = reinterpret_cast<cudaStream_t>(cuda_stream);
++
+     // Verts will be updated
+     _verts_retrieved = false;
+     _verts_shaped_retrieved = false;
+@@ -182,18 +185,19 @@ SMPLX_HOST void Body<ModelConfig>::_cuda_update(
+     // Copy parameters to GPU
+     cudaCheck(cudaMemcpyAsync(device.blendshape_params, h_blendshape_params,
+                 ModelConfig::n_blend_shapes() * sizeof(float),
+-               cudaMemcpyHostToDevice));
++               cudaMemcpyHostToDevice, stream));
+     // Shape blendshapes
+     cudaCheck(cudaMemcpyAsync(device.verts_shaped, model.device.verts,
+-               model.n_verts() * 3 * sizeof(float), cudaMemcpyDeviceToDevice));
++               model.n_verts() * 3 * sizeof(float), cudaMemcpyDeviceToDevice,
++               stream));
+     cuda_util::mmv_block<float, true>(model.device.blend_shapes,
+             device.blendshape_params, device.verts_shaped, ModelConfig::n_verts() * 3,
+-            ModelConfig::n_shape_blends());
++            ModelConfig::n_shape_blends(), stream);
+ 
+     // Joint regressor
+     // TODO: optimize sparse matrix multiplication, maybe use ELL format
+     dim3 jr_blocks(3, model.n_joints());
+-    device::joint_regressor<<<1, jr_blocks>>>(
++    device::joint_regressor<<<1, jr_blocks, 0, stream>>>(
+         device.verts_shaped, model.device.joint_reg.values, model.device.joint_reg.inner,
+         model.device.joint_reg.outer, device.joints_shaped);
+ 
+@@ -202,33 +206,47 @@ SMPLX_HOST void Body<ModelConfig>::_cuda_update(
+         // Note: this is the most expensive operation.
+         cuda_util::mmv_block<float, true>(model.device.blend_shapes + ModelConfig::n_shape_blends() * 3 * ModelConfig::n_verts(),
+                device.blendshape_params + ModelConfig::n_shape_blends(), device.verts_shaped, ModelConfig::n_verts() * 3,
+-               ModelConfig::n_pose_blends());
++               ModelConfig::n_pose_blends(), stream);
+     }
+ 
+     // Compute global joint transforms, this part can't be parallized and
+     // is horribly slow on GPU; we do it on CPU instead
+     // Actually, this is pretty bad too, TODO try implementing on GPU again
+     cudaCheck(cudaMemcpyAsync(_joints_shaped.data(), device.joints_shaped, model.n_joints() * 3 * sizeof(float),
+-               cudaMemcpyDeviceToHost));
++               cudaMemcpyDeviceToHost, stream));
++        cudaCheck(cudaStreamSynchronize(stream));
+     _local_to_global();
+     cudaCheck(cudaMemcpyAsync(device.joint_transforms, _joint_transforms.data(),
+-            _joint_transforms.size() * sizeof(float), cudaMemcpyHostToDevice));
++            _joint_transforms.size() * sizeof(float), cudaMemcpyHostToDevice,
++            stream));
+ 
+     // weights: (#verts, #joints)
+-    device::lbs<<<(model.verts.size() - 1) / BLOCK_SIZE + 1, BLOCK_SIZE>>>(
++        device::lbs<<<(model.verts.size() - 1) / BLOCK_SIZE + 1, BLOCK_SIZE, 0,
++              stream>>>(
+         device.joint_transforms, device.verts_shaped, model.device.weights.values,
+         model.device.weights.inner, model.device.weights.outer,
+         device.verts,
+         model.n_joints(), model.n_verts());
+ }
+ 
+-// Instantiation
+-template class Body<model_config::SMPL>;
+-template class Body<model_config::SMPL_v1>;
+-template class Body<model_config::SMPLH>;
+-template class Body<model_config::SMPLX>;
+-template class Body<model_config::SMPLXpca>;
+-template class Body<model_config::SMPLX_v1>;
+-template class Body<model_config::SMPLXpca_v1>;
++// Explicitly instantiate only CUDA member methods defined in this TU.
++// Avoid full class template instantiation under nvcc, which unnecessarily
++// instantiates host-only Eigen code paths and can crash newer toolchains.
++#define SMPLX_INSTANTIATE_BODY_CUDA_METHODS(MC)                               \
++    template void Body<MC>::_cuda_load();                                     \
++    template void Body<MC>::_cuda_free();                                     \
++    template void Body<MC>::_cuda_maybe_retrieve_verts() const;               \
++    template void Body<MC>::_cuda_maybe_retrieve_verts_shaped() const;        \
++    template void Body<MC>::_cuda_update(float*, float*, bool, void*)
++
++SMPLX_INSTANTIATE_BODY_CUDA_METHODS(model_config::SMPL);
++SMPLX_INSTANTIATE_BODY_CUDA_METHODS(model_config::SMPL_v1);
++SMPLX_INSTANTIATE_BODY_CUDA_METHODS(model_config::SMPLH);
++SMPLX_INSTANTIATE_BODY_CUDA_METHODS(model_config::SMPLX);
++SMPLX_INSTANTIATE_BODY_CUDA_METHODS(model_config::SMPLXpca);
++SMPLX_INSTANTIATE_BODY_CUDA_METHODS(model_config::SMPLX_v1);
++SMPLX_INSTANTIATE_BODY_CUDA_METHODS(model_config::SMPLXpca_v1);
++
++#undef SMPLX_INSTANTIATE_BODY_CUDA_METHODS
+ 
+ }  // namespace smplx
+diff --git a/src/cuda/model.cu b/src/cuda/model.cu
+index 3ed009f..d66afe9 100644
+--- a/src/cuda/model.cu
++++ b/src/cuda/model.cu
+@@ -63,13 +63,20 @@ __host__ void Model<ModelConfig>::_cuda_free() {
+     if (device.hand_mean_r) cudaFree(device.hand_mean_r);
+ }
+ 
+-// Instantiation
+-template class Model<model_config::SMPL>;
+-template class Model<model_config::SMPL_v1>;
+-template class Model<model_config::SMPLH>;
+-template class Model<model_config::SMPLX>;
+-template class Model<model_config::SMPLXpca>;
+-template class Model<model_config::SMPLX_v1>;
+-template class Model<model_config::SMPLXpca_v1>;
++// Explicitly instantiate only CUDA member methods defined in this TU.
++#define SMPLX_INSTANTIATE_MODEL_CUDA_METHODS(MC)                              \
++    template void Model<MC>::_cuda_load();                                    \
++    template void Model<MC>::_cuda_copy_template();                           \
++    template void Model<MC>::_cuda_free()
++
++SMPLX_INSTANTIATE_MODEL_CUDA_METHODS(model_config::SMPL);
++SMPLX_INSTANTIATE_MODEL_CUDA_METHODS(model_config::SMPL_v1);
++SMPLX_INSTANTIATE_MODEL_CUDA_METHODS(model_config::SMPLH);
++SMPLX_INSTANTIATE_MODEL_CUDA_METHODS(model_config::SMPLX);
++SMPLX_INSTANTIATE_MODEL_CUDA_METHODS(model_config::SMPLXpca);
++SMPLX_INSTANTIATE_MODEL_CUDA_METHODS(model_config::SMPLX_v1);
++SMPLX_INSTANTIATE_MODEL_CUDA_METHODS(model_config::SMPLXpca_v1);
++
++#undef SMPLX_INSTANTIATE_MODEL_CUDA_METHODS
+ 
+ }  // namespace smplx

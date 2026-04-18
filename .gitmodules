@@ -1,0 +1,12 @@
+[submodule "third_party/smplxpp"]
+	path = third_party/smplxpp
+	url = https://github.com/sxyu/smplxpp.git
+[submodule "third_party/torchure_smplx"]
+	path = third_party/torchure_smplx
+	url = https://github.com/Hydran00/torchure_smplx.git
+[submodule "third_party/smplx_pytorch"]
+	path = third_party/smplx_pytorch
+	url = https://github.com/gulvarol/smplpytorch.git
+[submodule "third_party/smplx"]
+	path = third_party/smplx
+	url = https://github.com/vchoutas/smplx.git

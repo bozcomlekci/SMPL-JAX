@@ -1,0 +1,590 @@
+diff --git a/include/smplx/smplx.hpp b/include/smplx/smplx.hpp
+index f026e74..31ec25f 100644
+--- a/include/smplx/smplx.hpp
++++ b/include/smplx/smplx.hpp
+@@ -84,6 +84,10 @@ inline auto batch_size(int batch_size) {
+     return [batch_size](internal::option &opt) { opt.batch_size = batch_size; };
+ }
+ 
++inline auto dtype(torch::ScalarType dtype) {
++    return [dtype](internal::option &opt) { opt.dtype = dtype; };
++}
++
+ using option = std::function<void(internal::option &)>;
+ 
+ template <typename T, typename... Args>
+diff --git a/samples/benchmark.cpp b/samples/benchmark.cpp
+index 275d834..c751d97 100644
+--- a/samples/benchmark.cpp
++++ b/samples/benchmark.cpp
+@@ -1,6 +1,133 @@
++#include <algorithm>
++#include <chrono>
++#include <cnpy.h>
++#include <filesystem>
+ #include <fstream>
++#include <iomanip>
++#include <iostream>
++#include <numeric>
++#include <optional>
++#include <stdexcept>
++#include <string>
++#include <vector>
++
+ #include "smplx.hpp"
+ 
++struct CliOptions {
++    std::string model_path;
++    std::optional<std::string> sequence_path;
++    int iterations = 1000;
++    int warmup = 2;
++    int repeats = 10;
++    int max_frames = 0;
++    std::string device = "auto"; // auto|cpu|cuda
++    std::string dtype = "float32"; // float32|float64
++};
++
++struct SequenceInputs {
++    torch::Tensor betas;
++    torch::Tensor global_orient;
++    torch::Tensor body_pose;
++    torch::Tensor transl;
++    int64_t n_frames = 0;
++};
++
++struct RuntimeStats {
++    double mean_ms = 0.0;
++    double p50_ms = 0.0;
++    double p95_ms = 0.0;
++    double fps = 0.0;
++};
++
++struct SequenceBenchmarkResult {
++    RuntimeStats stats;
++    int64_t vertices = 0;
++};
++
++void print_usage(const char *prog) {
++    std::cerr
++        << "Usage: " << prog << " <model_path> [options]\n"
++        << "\n"
++        << "Options:\n"
++        << "  --sequence <path>   Sequence npz (trans/root_orient/pose_body/betas)\n"
++        << "  --max-frames <n>    Limit sequence frames (0 = all)\n"
++        << "  --warmup <n>        Warmup iterations for sequence benchmark\n"
++        << "  --repeats <n>       Timed iterations for sequence benchmark\n"
++        << "  --iterations <n>    Iterations for legacy microbenchmark mode\n"
++        << "  --device <mode>     auto|cpu|cuda\n"
++        << "  --dtype <mode>      float32|float64\n";
++}
++
++torch::ScalarType parse_dtype(const std::string &dtype_name) {
++    if (dtype_name == "float32") {
++        return torch::kFloat32;
++    }
++    if (dtype_name == "float64") {
++        return torch::kFloat64;
++    }
++    throw std::runtime_error("--dtype must be one of: float32, float64");
++}
++
++std::string dtype_name(torch::ScalarType dtype) {
++    return dtype == torch::kFloat32 ? "float32" : "float64";
++}
++
++CliOptions parse_args(int argc, char *argv[]) {
++    if (argc < 2) {
++        throw std::runtime_error("Missing model path argument");
++    }
++
++    CliOptions opts;
++    opts.model_path = argv[1];
++
++    for (int i = 2; i < argc; ++i) {
++        const std::string arg = argv[i];
++        auto next_value = [&](const std::string &flag) -> std::string {
++            if (i + 1 >= argc) {
++                throw std::runtime_error("Missing value for flag: " + flag);
++            }
++            return argv[++i];
++        };
++
++        if (arg == "--sequence") {
++            opts.sequence_path = next_value(arg);
++        } else if (arg == "--max-frames") {
++            opts.max_frames = std::stoi(next_value(arg));
++        } else if (arg == "--warmup") {
++            opts.warmup = std::stoi(next_value(arg));
++        } else if (arg == "--repeats") {
++            opts.repeats = std::stoi(next_value(arg));
++        } else if (arg == "--iterations") {
++            opts.iterations = std::stoi(next_value(arg));
++        } else if (arg == "--device") {
++            opts.device = next_value(arg);
++        } else if (arg == "--dtype") {
++            opts.dtype = next_value(arg);
++        } else if (arg == "--help" || arg == "-h") {
++            print_usage(argv[0]);
++            std::exit(0);
++        } else {
++            throw std::runtime_error("Unknown argument: " + arg);
++        }
++    }
++
++    if (opts.warmup < 0 || opts.repeats <= 0 || opts.iterations <= 0 ||
++        opts.max_frames < 0) {
++        throw std::runtime_error(
++            "Invalid numeric argument: warmup>=0, repeats>0, iterations>0, "
++            "max_frames>=0 required");
++    }
++
++    if (opts.device != "auto" && opts.device != "cpu" && opts.device != "cuda") {
++        throw std::runtime_error("--device must be one of: auto, cpu, cuda");
++    }
++    if (opts.dtype != "float32" && opts.dtype != "float64") {
++        throw std::runtime_error("--dtype must be one of: float32, float64");
++    }
++
++    return opts;
++}
++
+ void save_obj(const std::string &filename, const torch::Tensor &vertices,
+               const torch::Tensor &faces) {
+     std::ofstream obj_file(filename);
+@@ -9,14 +136,12 @@ void save_obj(const std::string &filename, const torch::Tensor &vertices,
+     }
+     obj_file << std::fixed << std::setprecision(8);
+ 
+-    // Write vertices
+     for (int64_t i = 0; i < vertices.size(0); ++i) {
+         auto v = vertices[i];
+-        obj_file << "v " << v[0].item<float>() << " " << v[1].item<float>()
+-                 << " " << v[2].item<float>() << "\n";
++        obj_file << "v " << v[0].item<double>() << " " << v[1].item<double>()
++                 << " " << v[2].item<double>() << "\n";
+     }
+ 
+-    // Write faces (1-based indexing)
+     for (int64_t i = 0; i < faces.size(0); ++i) {
+         auto f = faces[i];
+         obj_file << "f " << f[0].item<int64_t>() + 1 << " "
+@@ -24,74 +149,320 @@ void save_obj(const std::string &filename, const torch::Tensor &vertices,
+                  << "\n";
+     }
+ }
+-// Compute FPS for N iterations of forward pass
++
++template <typename T>
++torch::Tensor npy2d_to_tensor(const cnpy::NpyArray &arr, int expected_cols,
++                              const torch::Device &device) {
++    if (arr.shape.size() != 2) {
++        throw std::runtime_error("Expected 2D npy array");
++    }
++    const int64_t rows = static_cast<int64_t>(arr.shape[0]);
++    const int64_t cols = static_cast<int64_t>(arr.shape[1]);
++    if (expected_cols > 0 && cols != expected_cols) {
++        throw std::runtime_error("Unexpected column count in sequence tensor");
++    }
++
++    const T *src = arr.data<T>();
++    std::vector<double> values(static_cast<size_t>(rows * cols));
++    for (int64_t r = 0; r < rows; ++r) {
++        for (int64_t c = 0; c < cols; ++c) {
++            const int64_t src_idx =
++                arr.fortran_order ? (c * rows + r) : (r * cols + c);
++            values[static_cast<size_t>(r * cols + c)] =
++                static_cast<double>(src[src_idx]);
++        }
++    }
++
++    auto tensor = torch::from_blob(values.data(), {rows, cols}, torch::kFloat64)
++                      .clone()
++                      .to(device);
++    return tensor;
++}
++
++torch::Tensor npy2d_to_tensor_double(const cnpy::NpyArray &arr,
++                                     int expected_cols,
++                                     const torch::Device &device) {
++    if (arr.word_size == sizeof(double)) {
++        return npy2d_to_tensor<double>(arr, expected_cols, device);
++    }
++    if (arr.word_size == sizeof(float)) {
++        return npy2d_to_tensor<float>(arr, expected_cols, device);
++    }
++    throw std::runtime_error("Unsupported dtype for 2D sequence tensor");
++}
++
++template <typename T>
++torch::Tensor npy1d_to_tensor(const cnpy::NpyArray &arr,
++                              const torch::Device &device) {
++    int64_t n = 0;
++    if (arr.shape.size() == 1) {
++        n = static_cast<int64_t>(arr.shape[0]);
++    } else if (arr.shape.size() == 2 && arr.shape[0] == 1) {
++        n = static_cast<int64_t>(arr.shape[1]);
++    } else if (arr.shape.size() == 2 && arr.shape[1] == 1) {
++        n = static_cast<int64_t>(arr.shape[0]);
++    } else {
++        throw std::runtime_error("Expected 1D betas array");
++    }
++
++    const T *src = arr.data<T>();
++    std::vector<double> values(static_cast<size_t>(n));
++    for (int64_t i = 0; i < n; ++i) {
++        values[static_cast<size_t>(i)] = static_cast<double>(src[i]);
++    }
++
++    return torch::from_blob(values.data(), {n}, torch::kFloat64).clone().to(device);
++}
++
++torch::Tensor npy1d_to_tensor_double(const cnpy::NpyArray &arr,
++                                     const torch::Device &device) {
++    if (arr.word_size == sizeof(double)) {
++        return npy1d_to_tensor<double>(arr, device);
++    }
++    if (arr.word_size == sizeof(float)) {
++        return npy1d_to_tensor<float>(arr, device);
++    }
++    throw std::runtime_error("Unsupported dtype for 1D sequence tensor");
++}
++
++double percentile(std::vector<double> values, double q) {
++    if (values.empty()) {
++        throw std::runtime_error("Cannot compute percentile of empty values");
++    }
++    std::sort(values.begin(), values.end());
++    const double pos = (q / 100.0) * static_cast<double>(values.size() - 1);
++    const auto lo = static_cast<size_t>(std::floor(pos));
++    const auto hi = static_cast<size_t>(std::ceil(pos));
++    const double w = pos - static_cast<double>(lo);
++    return values[lo] * (1.0 - w) + values[hi] * w;
++}
++
++SequenceInputs load_sequence_inputs(const std::string &sequence_path,
++                                    smplx::SMPL &model,
++                                    const torch::Device &device,
++                                    int max_frames,
++                                    torch::ScalarType dtype) {
++    if (!std::filesystem::exists(sequence_path)) {
++        throw std::runtime_error("Sequence path does not exist: " + sequence_path);
++    }
++
++    const cnpy::npz_t seq = cnpy::npz_load(sequence_path);
++    const auto require = [&](const std::string &name) -> const cnpy::NpyArray & {
++        auto it = seq.find(name);
++        if (it != seq.end()) {
++            return it->second;
++        }
++        it = seq.find(name + ".npy");
++        if (it != seq.end()) {
++            return it->second;
++        }
++        std::string available;
++        for (const auto &kv : seq) {
++            if (!available.empty()) {
++                available += ", ";
++            }
++            available += kv.first;
++        }
++        throw std::runtime_error("Missing key in sequence npz: " + name +
++                                 " (available: [" + available + "])");
++    };
++
++    auto transl = npy2d_to_tensor_double(require("trans"), 3, device);
++    auto global_orient = npy2d_to_tensor_double(require("root_orient"), 3, device);
++    auto pose_body = npy2d_to_tensor_double(require("pose_body"), 63, device);
++    auto betas_raw = npy1d_to_tensor_double(require("betas"), device);
++
++    transl = transl.to(dtype);
++    global_orient = global_orient.to(dtype);
++    pose_body = pose_body.to(dtype);
++    betas_raw = betas_raw.to(dtype);
++
++    int64_t n_frames = transl.size(0);
++    if (global_orient.size(0) != n_frames || pose_body.size(0) != n_frames) {
++        throw std::runtime_error(
++            "Sequence arrays have inconsistent first dimension lengths");
++    }
++
++    if (max_frames > 0 && n_frames > max_frames) {
++        n_frames = max_frames;
++        transl = transl.narrow(0, 0, n_frames).clone();
++        global_orient = global_orient.narrow(0, 0, n_frames).clone();
++        pose_body = pose_body.narrow(0, 0, n_frames).clone();
++    }
++
++    auto zeros6 = torch::zeros({n_frames, 6}, torch::dtype(dtype).device(device));
++    auto body_pose69 = torch::cat({pose_body, zeros6}, 1);
++
++    auto betas_one =
++        torch::zeros({model.num_betas()}, torch::dtype(dtype).device(device));
++    const int64_t copy_n = std::min<int64_t>(betas_one.size(0), betas_raw.numel());
++    if (copy_n > 0) {
++        betas_one.narrow(0, 0, copy_n).copy_(betas_raw.narrow(0, 0, copy_n));
++    }
++    auto betas_batch = betas_one.unsqueeze(0).repeat({n_frames, 1});
++
++    return {betas_batch, global_orient, body_pose69, transl, n_frames};
++}
++
+ double compute_fps(smplx::SMPL &model, const torch::Tensor &betas,
+                    const torch::Tensor &global_orient,
+                    const torch::Tensor &body_pose, const torch::Tensor &transl,
+-                   int iterations = 1000) {
++                   const torch::Device &device, int iterations = 1000) {
++    torch::InferenceMode guard(true);
+     auto start = std::chrono::high_resolution_clock::now();
+ 
+     for (int i = 0; i < iterations; ++i) {
+         auto output = model.forward(
+             smplx::betas(betas), smplx::global_orient(global_orient),
+             smplx::body_pose(body_pose), smplx::transl(transl));
++        if (device.is_cuda()) {
++            torch::cuda::synchronize();
++        }
+     }
+ 
+     auto end = std::chrono::high_resolution_clock::now();
+-    auto duration =
+-        std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
++    const double seconds =
++        std::chrono::duration_cast<std::chrono::duration<double>>(end - start)
+             .count();
+-    double seconds = duration / 1000.0;
+-    return iterations / seconds;
++    return static_cast<double>(iterations) / seconds;
+ }
+-int main(int argc, char *argv[]) {
+-    auto device = torch::cuda::is_available() ? torch::kCUDA : torch::kCPU;
+-    std::cout << "Cuda available: " << std::boolalpha
+-              << torch::cuda::is_available() << std::endl;
+-    std::string path = argv[1];
+-    if (argc < 2) {
+-        std::cerr << "Usage: " << argv[0] << " <model_path>" << std::endl;
+-        return 1;
++
++SequenceBenchmarkResult benchmark_sequence(smplx::SMPL &model,
++                                           const SequenceInputs &inputs,
++                                           int warmup, int repeats,
++                                           const torch::Device &device) {
++    torch::InferenceMode guard(true);
++    for (int i = 0; i < warmup; ++i) {
++        auto output = model.forward(
++            smplx::betas(inputs.betas), smplx::global_orient(inputs.global_orient),
++            smplx::body_pose(inputs.body_pose), smplx::transl(inputs.transl),
++            smplx::return_verts(true));
++        if (device.is_cuda()) {
++            torch::cuda::synchronize();
++        }
+     }
+-    if (!std::filesystem::exists(path)) {
+-        std::cerr << "Model path does not exist: " << path << std::endl;
+-        return 1;
++
++    std::vector<double> iter_ms;
++    iter_ms.reserve(static_cast<size_t>(repeats));
++
++    int64_t n_vertices = 0;
++    for (int i = 0; i < repeats; ++i) {
++        const auto t0 = std::chrono::high_resolution_clock::now();
++        auto output = model.forward(
++            smplx::betas(inputs.betas), smplx::global_orient(inputs.global_orient),
++            smplx::body_pose(inputs.body_pose), smplx::transl(inputs.transl),
++            smplx::return_verts(true));
++        if (device.is_cuda()) {
++            torch::cuda::synchronize();
++        }
++        const auto t1 = std::chrono::high_resolution_clock::now();
++
++        iter_ms.push_back(
++            std::chrono::duration_cast<std::chrono::duration<double, std::milli>>(t1 - t0)
++                .count());
++
++        if (n_vertices == 0 && output.vertices.has_value()) {
++            n_vertices = output.vertices.value().size(1);
++        }
+     }
+-    std::cout << "Using model path: " << path << std::endl;
+-    auto start = std::chrono::high_resolution_clock::now();
+-    smplx::SMPL smpl(path.c_str(), device);
+-    auto end = std::chrono::high_resolution_clock::now();
+-    auto duration =
+-        std::chrono::duration_cast<std::chrono::milliseconds>(end - start)
+-            .count();
+-    std::cout << "Model loaded in " << duration << " ms!" << std::endl;
+-    smpl.eval();
+-    std::cout << "Model has " << smpl.num_betas() << " betas, "
+-              << smpl.NUM_JOINTS << " joints " << std::endl;
+-
+-    int batch_size = 1;
+-    auto betas =
+-        -2 *
+-        torch::ones({batch_size, smpl.num_betas()}, torch::kFloat64).to(device);
+-    auto global_orient =
+-        torch::zeros({batch_size, 3}, torch::kFloat64).to(device);
+-    auto body_pose = torch::zeros({batch_size, 69}, torch::kFloat64).to(device);
+-    auto transl = torch::zeros({batch_size, 3}, torch::kFloat64).to(device);
+ 
+-    int iterations = 1000;
+-    double fps =
+-        compute_fps(smpl, betas, global_orient, body_pose, transl, iterations);
++    const double mean_ms = std::accumulate(iter_ms.begin(), iter_ms.end(), 0.0) /
++                           static_cast<double>(iter_ms.size());
++    const double p50_ms = percentile(iter_ms, 50.0);
++    const double p95_ms = percentile(iter_ms, 95.0);
++    const double fps = (static_cast<double>(inputs.n_frames) * 1000.0) /
++                       std::max(mean_ms, 1e-12);
++
++    return {{mean_ms, p50_ms, p95_ms, fps}, n_vertices};
++}
++
++int main(int argc, char *argv[]) {
++    try {
++        const CliOptions opts = parse_args(argc, argv);
++
++        const bool cuda_available = torch::cuda::is_available();
++        torch::Device device(torch::kCPU);
++        if (opts.device == "cuda") {
++            if (!cuda_available) {
++                throw std::runtime_error("CUDA requested but not available");
++            }
++            device = torch::Device(torch::kCUDA);
++        } else if (opts.device == "auto" && cuda_available) {
++            device = torch::Device(torch::kCUDA);
++        }
++        const torch::ScalarType model_dtype = parse_dtype(opts.dtype);
++
++        std::cout << "Cuda available: " << std::boolalpha << cuda_available
++                  << std::endl;
++        std::cout << "Resolved device: " << (device.is_cuda() ? "cuda" : "cpu")
++                  << std::endl;
++        std::cout << "Resolved dtype: " << dtype_name(model_dtype) << std::endl;
++
++        if (!std::filesystem::exists(opts.model_path)) {
++            throw std::runtime_error("Model path does not exist: " + opts.model_path);
++        }
++        std::cout << "Using model path: " << opts.model_path << std::endl;
++
++        auto t_load0 = std::chrono::high_resolution_clock::now();
++        smplx::SMPL smpl(opts.model_path.c_str(), device, smplx::dtype(model_dtype));
++        auto t_load1 = std::chrono::high_resolution_clock::now();
++        auto load_ms =
++            std::chrono::duration_cast<std::chrono::milliseconds>(t_load1 - t_load0)
++                .count();
++        std::cout << "Model loaded in " << load_ms << " ms!" << std::endl;
++        smpl.eval();
++        std::cout << "Model has " << smpl.num_betas() << " betas, "
++                  << smpl.NUM_JOINTS << " joints " << std::endl;
++
++        std::cout << std::fixed << std::setprecision(6);
+ 
+-    std::cout << "FPS (forward pass, run " << iterations << " iterations) @"
+-              << fps << " FPS" << std::endl;
++        if (opts.sequence_path.has_value()) {
++            const auto inputs =
++                load_sequence_inputs(opts.sequence_path.value(), smpl, device, opts.max_frames, model_dtype);
++            const auto seq_result =
++                benchmark_sequence(smpl, inputs, opts.warmup, opts.repeats, device);
+ 
+-    auto output =
+-        smpl.forward(smplx::betas(betas), smplx::global_orient(global_orient),
+-                     smplx::body_pose(body_pose), smplx::transl(transl),
+-                     smplx::return_verts(true));
++            std::cout << "Benchmark mode: sequence" << std::endl;
++            std::cout << "Sequence path: " << opts.sequence_path.value() << std::endl;
++            std::cout << "Sequence frames: " << inputs.n_frames << std::endl;
++            std::cout << "Vertices: " << seq_result.vertices << std::endl;
++            std::cout << "Mean runtime ms: " << seq_result.stats.mean_ms << std::endl;
++            std::cout << "P50 runtime ms: " << seq_result.stats.p50_ms << std::endl;
++            std::cout << "P95 runtime ms: " << seq_result.stats.p95_ms << std::endl;
++            std::cout << "Sequence FPS: " << seq_result.stats.fps << std::endl;
++            std::cout << "FPS (sequence forward, run " << opts.repeats
++                      << " iterations) @" << seq_result.stats.fps << " FPS"
++                      << std::endl;
++            return 0;
++        }
+ 
+-    auto faces = smpl.faces();
+-    auto vertices = output.vertices.value().squeeze(0); // (V, 3)
+-    save_obj("smpl_mesh.obj", vertices, faces);
+-    return 0;
++        // Legacy microbenchmark path kept for backwards compatibility.
++        const int batch_size = 1;
++        auto betas =
++            -2 * torch::ones({batch_size, smpl.num_betas()}, torch::dtype(model_dtype).device(device));
++        auto global_orient = torch::zeros({batch_size, 3}, torch::dtype(model_dtype).device(device));
++        auto body_pose = torch::zeros({batch_size, 69}, torch::dtype(model_dtype).device(device));
++        auto transl = torch::zeros({batch_size, 3}, torch::dtype(model_dtype).device(device));
++
++        const double fps = compute_fps(
++            smpl, betas, global_orient, body_pose, transl, device, opts.iterations);
++
++        std::cout << "Benchmark mode: micro" << std::endl;
++        std::cout << "FPS (forward pass, run " << opts.iterations << " iterations) @"
++                  << fps << " FPS" << std::endl;
++
++        auto output =
++            smpl.forward(smplx::betas(betas), smplx::global_orient(global_orient),
++                         smplx::body_pose(body_pose), smplx::transl(transl),
++                         smplx::return_verts(true));
++
++        auto faces = smpl.faces();
++        auto vertices = output.vertices.value().squeeze(0);
++        save_obj("smpl_mesh.obj", vertices, faces);
++        return 0;
++    } catch (const std::exception &e) {
++        std::cerr << "Error: " << e.what() << std::endl;
++        print_usage(argv[0]);
++        return 1;
++    }
+ }
+diff --git a/src/smplx/smplx.cpp b/src/smplx/smplx.cpp
+index be3b09a..23ca659 100644
+--- a/src/smplx/smplx.cpp
++++ b/src/smplx/smplx.cpp
+@@ -38,7 +38,7 @@ auto SMPL::construct(const char *model_path) -> void {
+     };
+ 
+     try {
+-        shapedirs_ = load_required_tensor("shapedirs", torch::kFloat64);
++        shapedirs_ = load_required_tensor("shapedirs", vars_.dtype);
+         auto num_betas = shapedirs_.size(2);
+ 
+         faces_ = load_required_tensor("f", torch::kUInt32);
+@@ -51,9 +51,9 @@ auto SMPL::construct(const char *model_path) -> void {
+                 cnpy::npz_load(vars_.kid_template_path.value());
+ 
+             torch::Tensor v_template_adult =
+-                load_required_tensor("v_template", torch::kFloat64);
++                load_required_tensor("v_template", vars_.dtype);
+             torch::Tensor v_template_kid =
+-                cnpyToTensor(kid_data.at("v_template"), torch::kFloat64)
++                cnpyToTensor(kid_data.at("v_template"), vars_.dtype)
+                     .to(device_);
+ 
+             v_template_kid -= torch::mean(v_template_kid, 0);
+@@ -90,19 +90,19 @@ auto SMPL::construct(const char *model_path) -> void {
+                              torch::dtype(vars_.dtype).device(device_)));
+         }
+ 
+-        v_template_ = load_required_tensor("v_template", torch::kFloat64);
++        v_template_ = load_required_tensor("v_template", vars_.dtype);
+         if (vars_.v_template.has_value()) {
+             v_template_ = vars_.v_template.value().clone().to(device_);
+         }
+ 
+-        J_regressor_ = load_required_tensor("J_regressor", torch::kFloat64);
++        J_regressor_ = load_required_tensor("J_regressor", vars_.dtype);
+ 
+-        posedirs_ = load_required_tensor("posedirs", torch::kFloat64);
++        posedirs_ = load_required_tensor("posedirs", vars_.dtype);
+         posedirs_ = posedirs_.reshape({-1, posedirs_.size(2)})
+                         .transpose(0, 1)
+                         .contiguous();
+ 
+-        lbs_weights_ = load_required_tensor("weights", torch::kFloat64);
++        lbs_weights_ = load_required_tensor("weights", vars_.dtype);
+ 
+         parents_ = torch::from_blob((void *)parents,
+                                     {sizeof(parents) / sizeof(parents[0])},
