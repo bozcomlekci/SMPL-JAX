@@ -6,7 +6,7 @@
   <img src="benchmarks/figures/header_runtime_readme.png" width="800">
 </p>
 
-SMPL-JAX provides a clean, hardware-accelerated JAX port of the [SMPL](https://smpl.is.tue.mpg.de/) and [SMPL-X](https://smpl-x.is.tue.mpg.de/) parametric human body models. Every operation — shape blend shapes, forward kinematics, linear blend skinning, and pose inversion — is compatible with `jax.jit`, `jax.vmap`, and `jax.grad`, enabling large-scale batched fitting, differentiable optimization, and humanoid robotics pipelines.
+SMPL-JAX provides a clean, hardware-accelerated JAX port of the [SMPL](https://smpl.is.tue.mpg.de/) and [SMPL-X](https://smpl-x.is.tue.mpg.de/) parametric human body models. Every operation — shape blend shapes, forward kinematics, linear blend skinning, and pose inversion — is compatible with `jax.jit`, `jax.vmap`, and `jax.grad`, enabling large-scale batched fitting and differentiable optimization.
 
 ---
 
@@ -266,7 +266,18 @@ Model weights are subject to their respective licenses from MPI-IS. Code in this
 
 ## Citation
 
-If you use SMPL-JAX in your research, please also cite the original SMPL-X work:
+If you use SMPL-JAX in your research, please cite this repository:
+
+```bibtex
+@misc{smpljax,
+  title  = {SMPL-JAX: Fully differentiable, JIT-compiled implementations of SMPL and SMPL-X in JAX},
+  author = {Batuhan Ozcomlekci},
+  year   = {2026},
+  howpublished = {\url{https://github.com/bozcomlekci/SMPL-JAX}},
+}
+```
+
+Please also cite the original SMPL-X work:
 
 ```bibtex
 @inproceedings{SMPL-X:2019,
