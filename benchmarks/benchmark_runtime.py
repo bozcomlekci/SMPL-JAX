@@ -231,6 +231,59 @@ def _query_process_gpu_memory_mib_robust(pid: int) -> float | None:
     return sample
 
 
+def _jax_device_memory_stats(device) -> dict[str, Any] | None:
+    try:
+        getter = getattr(device, "memory_stats", None)
+        if getter is None:
+            return None
+        stats = getter()
+    except Exception:
+        return None
+    if isinstance(stats, dict):
+        return stats
+    return None
+
+
+def _jax_device_bytes_in_use(device) -> int | None:
+    stats = _jax_device_memory_stats(device)
+    if stats is None:
+        return None
+
+    for key in ("bytes_in_use", "pool_bytes", "bytes_reserved"):
+        value = stats.get(key)
+        if value is None:
+            continue
+        try:
+            numeric = int(value)
+        except Exception:
+            continue
+        if numeric >= 0:
+            return numeric
+    return None
+
+
+def _make_process_gpu_memory_delta_callbacks(
+    *,
+    pid: int | None = None,
+) -> tuple[Callable[[], None], Callable[[], float | None]]:
+    target_pid = int(os.getpid() if pid is None else pid)
+    state: dict[str, float | None] = {"before_mib": None}
+
+    def before_memory_cb() -> None:
+        state["before_mib"] = _query_process_gpu_memory_mib_robust(target_pid)
+
+    def after_memory_cb() -> float | None:
+        after_mib = _query_process_gpu_memory_mib_robust(target_pid)
+        if after_mib is None:
+            return None
+        before_mib = state.get("before_mib")
+        if before_mib is None:
+            return float(after_mib)
+        return max(0.0, float(after_mib - before_mib))
+
+    return before_memory_cb, after_memory_cb
+
+
 def _gpu_memory_summary(samples_mib: list[float], source: str) -> dict[str, Any]:
     if not samples_mib:
         return {
@@ -534,6 +587,7 @@ def benchmark_jax_smplx(
 ) -> dict[str, Any]:
     os.environ["JAX_PLATFORMS"] = "METAL" if jax_platform.lower() == "metal" else jax_platform
     os.environ["XLA_FLAGS"] = f"--xla_gpu_autotune_level={xla_gpu_autotune_level}"
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     import jax
     import jax.numpy as jnp
 
@@ -574,14 +628,21 @@ def benchmark_jax_smplx(
 
     jax_device = jax.devices()[0]
     jax_device_class = _jax_device_label(jax_device)
-    gpu_memory_source = "nvidia_smi_process" if jax_device_class == "gpu" else "not_applicable_cpu"
-    after_memory_cb = (lambda: _query_process_gpu_memory_mib_robust(os.getpid())) if jax_device_class == "gpu" else None
+    gpu_memory_source = "not_applicable_cpu"
+    before_memory_cb = None
+    after_memory_cb = None
+    if jax_device_class == "gpu":
+        gpu_memory_source = "nvidia_smi_process"
+
+        def after_memory_cb() -> float | None:
+            return _query_process_gpu_memory_mib_robust(os.getpid())
 
     times_s, gpu_memory_samples = _time_repeats(
         run_once,
         sync_once,
         repeats=repeats,
         warmup=warmup,
+        before_timed_iteration=before_memory_cb,
         after_timed_iteration=after_memory_cb,
     )
     info = _summary(times_s, n_frames=n_frames)
@@ -620,6 +681,7 @@ def benchmark_jax_smpl(
 ) -> dict[str, Any]:
     os.environ["JAX_PLATFORMS"] = "METAL" if jax_platform.lower() == "metal" else jax_platform
     os.environ["XLA_FLAGS"] = f"--xla_gpu_autotune_level={xla_gpu_autotune_level}"
+    os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
     import jax
     import jax.numpy as jnp
 
@@ -655,14 +717,21 @@ def benchmark_jax_smpl(
 
     jax_device = jax.devices()[0]
     jax_device_class = _jax_device_label(jax_device)
-    gpu_memory_source = "nvidia_smi_process" if jax_device_class == "gpu" else "not_applicable_cpu"
-    after_memory_cb = (lambda: _query_process_gpu_memory_mib_robust(os.getpid())) if jax_device_class == "gpu" else None
+    gpu_memory_source = "not_applicable_cpu"
+    before_memory_cb = None
+    after_memory_cb = None
+    if jax_device_class == "gpu":
+        gpu_memory_source = "nvidia_smi_process"
+
+        def after_memory_cb() -> float | None:
+            return _query_process_gpu_memory_mib_robust(os.getpid())
 
     times_s, gpu_memory_samples = _time_repeats(
         run_once,
         sync_once,
         repeats=repeats,
         warmup=warmup,
+        before_timed_iteration=before_memory_cb,
         after_timed_iteration=after_memory_cb,
     )
     info = _summary(times_s, n_frames=n_frames)
@@ -756,13 +825,10 @@ def benchmark_torch_smplx(
     before_memory_cb = None
     after_memory_cb = None
     if torch_device_class == "gpu":
-        gpu_memory_source = "torch_cuda_allocator_peak"
+        gpu_memory_source = "nvidia_smi_process"
 
-        def before_memory_cb() -> None:
-            torch.cuda.reset_peak_memory_stats(device)
-
-        def after_memory_cb() -> float:
-            return float(torch.cuda.max_memory_allocated(device)) / _MIB_BYTES
+        def after_memory_cb() -> float | None:
+            return _query_process_gpu_memory_mib_robust(os.getpid())
 
     times_s, gpu_memory_samples = _time_repeats(
         run_once,
@@ -856,13 +922,10 @@ def benchmark_torch_smpl(
     before_memory_cb = None
     after_memory_cb = None
     if torch_device_class == "gpu":
-        gpu_memory_source = "torch_cuda_allocator_peak"
+        gpu_memory_source = "nvidia_smi_process"
 
-        def before_memory_cb() -> None:
-            torch.cuda.reset_peak_memory_stats(device)
-
-        def after_memory_cb() -> float:
-            return float(torch.cuda.max_memory_allocated(device)) / _MIB_BYTES
+        def after_memory_cb() -> float | None:
+            return _query_process_gpu_memory_mib_robust(os.getpid())
 
     times_s, gpu_memory_samples = _time_repeats(
         run_once,
@@ -956,13 +1019,10 @@ def benchmark_torch_smplpytorch(
     before_memory_cb = None
     after_memory_cb = None
     if torch_device_class == "gpu":
-        gpu_memory_source = "torch_cuda_allocator_peak"
+        gpu_memory_source = "nvidia_smi_process"
 
-        def before_memory_cb() -> None:
-            torch.cuda.reset_peak_memory_stats(device)
-
-        def after_memory_cb() -> float:
-            return float(torch.cuda.max_memory_allocated(device)) / _MIB_BYTES
+        def after_memory_cb() -> float | None:
+            return _query_process_gpu_memory_mib_robust(os.getpid())
 
     times_s, gpu_memory_samples = _time_repeats(
         run_once,
@@ -1084,6 +1144,7 @@ def benchmark_smplxpp_python(
 
     first = run_once()
     gpu_memory_source = "nvidia_smi_process" if not force_cpu else "not_applicable_cpu"
+    before_memory_cb = None
     after_memory_cb = (lambda: _query_process_gpu_memory_mib_robust(os.getpid())) if not force_cpu else None
     times_s, gpu_memory_samples = _time_repeats(
         run_once,
@@ -1245,6 +1306,7 @@ def benchmark_smplxpp_python_smplx(
 
     first = run_once()
     gpu_memory_source = "nvidia_smi_process" if not force_cpu else "not_applicable_cpu"
+    before_memory_cb = None
     after_memory_cb = (lambda: _query_process_gpu_memory_mib_robust(os.getpid())) if not force_cpu else None
     times_s, gpu_memory_samples = _time_repeats(
         run_once,
@@ -1578,6 +1640,15 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--jax-isolated-subprocess",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Run JAX benchmark calls in isolated subprocesses to avoid backend side effects "
+            "in mixed benchmark runs."
+        ),
+    )
+    parser.add_argument(
         "--batch-size-sweep",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1693,7 +1764,7 @@ def main() -> None:
         type=Path,
         default=Path("data/smplx/SMPLX_NEUTRAL.npz"),
     )
-    parser.add_argument("--json-out", type=Path, default=Path("benchmarks/results/benchmark_results.json"))
+    parser.add_argument("--json-out", type=Path, default=Path("benchmarks/results/rtx5080/benchmark_results.json"))
     args = parser.parse_args()
     method_filter = {m.strip() for m in args.method_filter.split(",") if m.strip()}
 
@@ -1764,6 +1835,7 @@ def main() -> None:
             "--no-include-smplxpp",
             "--no-include-torchure",
             "--no-batch-size-sweep",
+            "--no-jax-isolated-subprocess",
         ]
         if max_frames > 0:
             cmd.extend(["--max-frames", str(max_frames)])
@@ -1900,7 +1972,14 @@ def main() -> None:
                     print(f"  skipped torchure ({dev}, batch={seq_frames}, profile={profile}): {exc}")
 
         if run_jax_smplx or run_jax_smpl:
-            if args.benchmark_both_devices and len(jax_platforms) > 1:
+            enabled_jax_methods: list[str] = []
+            if run_jax_smplx:
+                enabled_jax_methods.append("jax_smplx")
+            if run_jax_smpl:
+                enabled_jax_methods.append("jax_smpl")
+            method_filter_csv = ",".join(enabled_jax_methods)
+
+            if args.jax_isolated_subprocess:
                 for jax_platform in jax_platforms:
                     print(f"Running JAX benchmarks in isolated subprocess ({jax_platform}, batch={seq_frames}, profile={profile})...")
                     try:
@@ -1909,7 +1988,7 @@ def main() -> None:
                             repeats=repeats,
                             warmup=warmup,
                             max_frames=seq_frames,
-                            method_filter_csv="jax_smplx,jax_smpl",
+                            method_filter_csv=method_filter_csv,
                         )
                         for row in jax_rows:
                             row["frames"] = int(seq_frames)

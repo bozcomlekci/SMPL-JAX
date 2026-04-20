@@ -8,12 +8,11 @@ import os
 # Create figures directory if it doesn't exist
 os.makedirs('benchmarks/figures', exist_ok=True)
 
-# Load data - prioritize batch8192 combined if it has more data points
-# but benchmark_results.json is also good.
+# Load data from organized results layout.
 try:
-    df = pd.read_json('benchmarks/results/batch8192/combined.json')
+    df = pd.read_json('benchmarks/results/rtx5080/benchmark_results.json')
 except:
-    df = pd.read_json('benchmarks/results/benchmark_results.json')
+    df = pd.read_json('benchmarks/results/rtx5080/combined.json')
 
 # Create a Family column based on the implementation name
 df['Family'] = df['implementation'].apply(lambda x: 'SMPL-X' if 'smplx' in x and 'smplx_torch_smpl' not in x else 'SMPL')
