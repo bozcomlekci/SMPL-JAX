@@ -9,3 +9,4 @@ data/
 smpl_models/
 datasets/
 .pytest_cache/
+benchmarks/logs/

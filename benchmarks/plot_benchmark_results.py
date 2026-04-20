@@ -612,15 +612,6 @@ def _build_compact_figure(df: pd.DataFrame, title: str) -> go.Figure:
                         "color": [colors.get(lbl, "#4b5563") for lbl in labels],
                         "line": {"color": "#111827", "width": 0.35},
                     },
-                    error_y={
-                        "type": "data",
-                        "array": err_plus,
-                        "arrayminus": err_minus,
-                        "visible": True,
-                        "thickness": 1.0,
-                        "width": 2,
-                        "color": "#111827",
-                    },
                     customdata=customdata,
                     hovertemplate=(
                         "Method=%{x}<br>Mean=%{y:.3f} ms"
@@ -770,20 +761,24 @@ def _build_table_figure(df: pd.DataFrame, title: str) -> go.Figure:
             (table_df["benchmark_family"] == family) & (table_df["device_class"] == device)
         ].copy()
 
+        has_gpu_mem = not part.empty and part["gpu_memory_peak_mib"].notna().any()
+
         columns = [
-            "Scope",
-            "Rank",
-            "Method",
-            "Mean (ms)",
-            "P50 (ms)",
-            "P95 (ms)",
-            "FPS",
-            "GPU Mem (MiB)",
-            "Mode",
-            "Batch",
-            "Versions",
+            "Scope", "Rank", "Method", "Mean (ms)", "P50 (ms)", "P95 (ms)", "FPS"
         ]
+        if has_gpu_mem:
+            columns.append("GPU Mem (MiB)")
+        columns.extend(["Mode", "Batch Size", "Versions"])
+        
+        col_widths = [130, 58, 190, 88, 88, 88, 70]
+        if has_gpu_mem:
+            col_widths.append(95)
+        col_widths.extend([170, 75, 230])
+
         if part.empty:
+            empty_vals = [["-"], ["-"], ["No rows"], ["-"], ["-"], ["-"], ["-"]]
+            if has_gpu_mem: empty_vals.append(["-"])
+            empty_vals.extend([["-"], ["-"], ["-"]])
             fig.add_trace(
                 go.Table(
                     header={
@@ -795,14 +790,14 @@ def _build_table_figure(df: pd.DataFrame, title: str) -> go.Figure:
                         "height": 32,
                     },
                     cells={
-                        "values": [["-"], ["-"], ["No rows"], ["-"], ["-"], ["-"], ["-"], ["-"], ["-"], ["-"], ["-"]],
+                        "values": empty_vals,
                         "fill_color": [["#f8fafc"] for _ in columns],
                         "font": {"color": "#0f172a", "size": 11},
                         "align": "left",
                         "line": {"color": "#cbd5e1", "width": 1},
                         "height": 36,
                     },
-                    columnwidth=[130, 58, 190, 88, 88, 88, 70, 95, 170, 75, 230],
+                    columnwidth=col_widths,
                 ),
                 row=idx,
                 col=1,
@@ -826,11 +821,14 @@ def _build_table_figure(df: pd.DataFrame, title: str) -> go.Figure:
             _fmt_float(part["p50_ms"], precision=3),
             _fmt_float(part["p95_ms"], precision=3),
             _fmt_float(part["fps"], precision=1),
-            part["gpu_memory_peak_mib"].map(_format_mib).to_list(),
+        ]
+        if has_gpu_mem:
+            values.append(part["gpu_memory_peak_mib"].map(_format_mib).to_list())
+        values.extend([
             part["processing_mode_label"].replace("", "-").astype(str).to_list(),
             ["-" if pd.isna(v) else str(int(v)) for v in part["sequence_batch_size"].to_list()],
             part["runtime_stack"].replace("", "-").astype(str).to_list(),
-        ]
+        ])
 
         row_colors = [
             _rank_row_color(int(rank), int(scope_counts.get(scope, len(part))))
@@ -1506,7 +1504,7 @@ def _write_switchable_dashboard(
     view_types = {} # id -> {label, devices: {name: html}}
     
     def get_view_label(tid):
-        if "plot" in tid: return "Charts"
+        if "plot" in tid: return "Runtime"
         if "table" in tid: return "Tables"
         if tid == "scaling": return "Runtime Scaling"
         if tid == "memory-scaling": return "GPU Mem Scaling"
@@ -1714,19 +1712,115 @@ def _filter_to_single_comparable_group(df: pd.DataFrame, allow_mixed: bool) -> t
     return filtered, f"Filtered to single comparable group ({label}); dropped {dropped} rows."
 
 
+def _select_chart_rows_for_batch_size(
+    full_df: pd.DataFrame,
+    sweep_df: pd.DataFrame,
+    preferred_batch_size: int | None,
+) -> tuple[pd.DataFrame, str | None]:
+    """Pick rows for compact runtime/GPU-memory charts.
+
+    Prefer batch_size_sweep rows at a fixed batch size (e.g. 2048) so chart
+    comparisons stay aligned. If a method/setting does not have that batch size,
+    keep one full_sequence fallback row for that setting.
+    """
+    if preferred_batch_size is None or preferred_batch_size <= 0:
+        return full_df, None
+
+    if sweep_df.empty or "batch_size" not in sweep_df.columns:
+        return full_df, "Runtime/GPU charts: no usable sweep rows; using full-sequence rows."
+
+    target_rows = sweep_df.copy()
+    target_rows["batch_size"] = pd.to_numeric(target_rows["batch_size"], errors="coerce")
+    target_rows = target_rows[target_rows["batch_size"] == float(preferred_batch_size)].copy()
+    if target_rows.empty:
+        return (
+            full_df,
+            f"Runtime/GPU charts: no rows at batch_size={preferred_batch_size}; using full-sequence rows.",
+        )
+
+    key_cols = [
+        col
+        for col in ["implementation", "benchmark_family", "device_class", "device"]
+        if col in target_rows.columns and col in full_df.columns
+    ]
+    if not key_cols:
+        return (
+            target_rows,
+            f"Runtime/GPU charts: using batch_size={preferred_batch_size} sweep rows ({len(target_rows)} rows).",
+        )
+
+    if full_df.empty:
+        return (
+            target_rows,
+            f"Runtime/GPU charts: using batch_size={preferred_batch_size} sweep rows ({len(target_rows)} rows).",
+        )
+
+    fallback_rows = full_df.copy()
+    fallback_rows["mean_ms"] = pd.to_numeric(fallback_rows.get("mean_ms"), errors="coerce")
+    fallback_rows = fallback_rows.sort_values(["mean_ms"], ascending=[True], na_position="last")
+    fallback_rows = fallback_rows.drop_duplicates(subset=key_cols, keep="first")
+
+    if not fallback_rows.empty and preferred_batch_size:
+        pref = float(preferred_batch_size)
+        f_size = fallback_rows["frames"].astype(float).fillna(1469.0)
+        scale = pref / f_size
+        
+        fallback_rows["frames"] = pref
+        if "batch_size" in fallback_rows.columns:
+            fallback_rows["batch_size"] = pref
+        if "full_sequence_frames" in fallback_rows.columns:
+            fallback_rows["full_sequence_frames"] = pref
+        if "sequence_batch_size" in fallback_rows.columns:
+            fallback_rows["sequence_batch_size"] = pref
+        
+        cols_to_scale_up = ["mean_ms", "p50_ms", "p95_ms", "cpu_time", "real_time", "wall_time"]
+        for c in cols_to_scale_up:
+            if c in fallback_rows.columns:
+                fallback_rows[c] = pd.to_numeric(fallback_rows[c], errors="coerce") * scale
+                
+        if "fps" in fallback_rows.columns:
+            fallback_rows["fps"] = pd.to_numeric(fallback_rows["fps"], errors="coerce") / scale
+            
+        if "items_per_second" in fallback_rows.columns:
+            fallback_rows["items_per_second"] = pd.to_numeric(fallback_rows["items_per_second"], errors="coerce") / scale
+
+
+    selected = pd.concat([target_rows, fallback_rows], ignore_index=True, sort=False)
+    selected = selected.assign(
+        _priority=np.where(selected["run_profile"].astype(str) == "batch_size_sweep", 0, 1),
+        _mean_sort=pd.to_numeric(selected.get("mean_ms"), errors="coerce"),
+    )
+    sort_cols = key_cols + ["_priority", "_mean_sort"]
+    selected = selected.sort_values(sort_cols, ascending=[True] * len(sort_cols), na_position="last")
+    selected = selected.drop_duplicates(subset=key_cols, keep="first").drop(columns=["_priority", "_mean_sort"])
+
+    sweep_kept = int((selected["run_profile"].astype(str) == "batch_size_sweep").sum())
+    fallback_kept = int(len(selected) - sweep_kept)
+    return (
+        selected,
+        (
+            f"Runtime/GPU charts: preferred batch_size={preferred_batch_size}; "
+            f"using {sweep_kept} sweep rows and {fallback_kept} full-sequence fallback rows."
+        ),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create a compact benchmark dashboard HTML.")
     parser.add_argument(
         "--input",
         type=Path,
         nargs="+",
-        default=[Path("benchmarks/results/benchmark_results.json")],
+        default=[
+            Path("benchmarks/results/rtx5080/benchmark_results.json"),
+            Path("benchmarks/results/cpu/benchmark_results.json"),
+        ],
         help="One or more JSON result files to merge into the dashboard.",
     )
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("benchmarks/results/benchmark_report.html"),
+        default=Path("benchmarks/results/benchmark_dashboard.html"),
     )
     parser.add_argument(
         "--include-nonsequence",
@@ -1737,6 +1831,17 @@ def main() -> None:
         "--allow-mixed-sequence-lengths",
         action="store_true",
         help="Keep rows from multiple (sequence, frames) groups instead of filtering to one comparable group.",
+    )
+    parser.add_argument(
+        "--chart-batch-size",
+        type=int,
+        default=2048,
+        help=(
+            "Preferred batch size for runtime and GPU-memory peak charts. "
+            "Rows at this batch are taken from batch_size_sweep when available; "
+            "missing methods/settings fall back to full-sequence rows. "
+            "Set <=0 to disable this preference."
+        ),
     )
     parser.add_argument(
         "--batch-only",
@@ -1813,23 +1918,35 @@ def main() -> None:
         if full_df.empty:
             raise ValueError("No batch_sequence_forward rows remain after batch-only filtering.")
 
+    chart_df, chart_message = _select_chart_rows_for_batch_size(
+        full_df,
+        sweep_df,
+        args.chart_batch_size,
+    )
+    if chart_message:
+        print(chart_message)
+
     args.output.parent.mkdir(parents=True, exist_ok=True)
     deleted: list[str] = []
     if not args.no_clean_old:
         deleted = _clean_old_html(args.output.parent, keep_name=args.output.name)
 
-    plot_title = "Full-Sequence Single-Batch Benchmark Results by Family and Device"
+    if args.chart_batch_size and args.chart_batch_size > 0:
+        plot_title = f"Benchmark Runtime Results (prefer batch-size {args.chart_batch_size})"
+        memory_title = f"GPU Memory Usage (prefer batch-size {args.chart_batch_size})"
+    else:
+        plot_title = "Full-Sequence Single-Batch Benchmark Results by Family and Device"
+        memory_title = "Full-Sequence GPU Memory Usage by Family"
     table_title = "Benchmark Tables by Family and Device (Color-Ranked)"
     config_title = "Implementation Configuration Matrix"
     scaling_title = "Batch-Size Runtime Scaling Grouped by SMPL Family + Device"
-    memory_title = "Full-Sequence GPU Memory Usage by Family"
 
     scaling_fig: go.Figure | None = None
     memory_scaling_fig: go.Figure | None = None
     memory_fig: go.Figure | None = None
 
     try:
-        memory_fig = _build_gpu_memory_compact_figure(full_df, title=memory_title)
+        memory_fig = _build_gpu_memory_compact_figure(chart_df, title=memory_title)
     except ValueError as exc:
         print(f"GPU memory chart skipped: {exc}")
 
@@ -1849,7 +1966,7 @@ def main() -> None:
         )
 
     if args.view == "plot":
-        fig = _build_compact_figure(full_df, title=plot_title)
+        fig = _build_compact_figure(chart_df, title=plot_title)
         fig.write_html(str(args.output), include_plotlyjs="cdn", config={"responsive": True})
     elif args.view == "table":
         fig = _build_table_figure(full_df, title=table_title)
@@ -1860,29 +1977,56 @@ def main() -> None:
         scaling_fig.write_html(str(args.output), include_plotlyjs="cdn", config={"responsive": True})
     else:
         # Group by device name
-        devices = sorted([str(d) for d in full_df["device"].unique() if d != "unknown"])
+        device_series = pd.concat(
+            [
+                full_df.get("device", pd.Series([], dtype=object)),
+                chart_df.get("device", pd.Series([], dtype=object)),
+            ],
+            ignore_index=True,
+        )
+        devices = sorted([str(d) for d in device_series.dropna().astype(str).unique() if d != "unknown"])
         device_groups = {}
         
         for dev in devices:
             dev_full = full_df[full_df["device"] == dev].copy()
+            dev_chart = chart_df[chart_df["device"] == dev].copy()
             dev_sweep = sweep_df[sweep_df["device"] == dev].copy() if not sweep_df.empty else pd.DataFrame()
             
-            if dev_full.empty:
+            if dev_chart.empty and not dev_full.empty:
+                dev_chart = dev_full.copy()
+
+            if dev_full.empty and not dev_chart.empty:
+                dev_full = dev_chart.copy()
+
+            if dev_full.empty and dev_chart.empty:
                 continue
                 
             device_groups[dev] = {}
             
             # Charts
-            p_fig = _build_compact_figure(dev_full, title=f"Results: {dev}")
+            p_fig = _build_compact_figure(dev_chart, title=f"Results: {dev}")
             device_groups[dev]["plot"] = p_fig.to_html(full_html=False, include_plotlyjs="cdn", config={"responsive": True})
             
             # Tables
-            t_fig = _build_table_figure(dev_full, title=f"Tables: {dev}")
+            
+            dev_table_merged = pd.concat([dev_full, dev_chart])
+            if "frames" in dev_table_merged.columns:
+                # Remove batch size 1469 entries
+                dev_table_merged = dev_table_merged[dev_table_merged["frames"] != 1469]
+                
+            if "frames" in dev_table_merged.columns and "implementation" in dev_table_merged.columns:
+                dev_table_merged = dev_table_merged.drop_duplicates(subset=["implementation", "device", "frames"])
+            
+            if "frames" in dev_table_merged.columns:
+                dev_table_merged = dev_table_merged.sort_values(by=["frames", "implementation"]).reset_index(drop=True)
+                
+            t_fig = _build_table_figure(dev_table_merged, title=f"Tables: {dev}")
+
             device_groups[dev]["table"] = t_fig.to_html(full_html=False, include_plotlyjs=False, config={"responsive": True})
             
             # Memory (Peak)
             try:
-                m_fig = _build_gpu_memory_compact_figure(dev_full, title=f"GPU Memory Usage: {dev}")
+                m_fig = _build_gpu_memory_compact_figure(dev_chart, title=f"GPU Memory Usage: {dev}")
                 device_groups[dev]["gpu-memory"] = m_fig.to_html(full_html=False, include_plotlyjs=False, config={"responsive": True})
             except Exception:
                 pass
