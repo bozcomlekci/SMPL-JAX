@@ -1731,7 +1731,16 @@ def main() -> None:
         default="",
         help="Internal: comma-separated method keys to run (e.g. jax_smplx,jax_smpl).",
     )
-    parser.add_argument("--xla-gpu-autotune-level", type=int, default=0)
+    parser.add_argument(
+        "--xla-gpu-autotune-level",
+        type=int,
+        default=4,
+        help=(
+            "XLA GPU autotune level (4 = XLA's own default). Level 0 disables GEMM "
+            "algorithm autotuning, which prevents XLA from selecting TF32 tensor-core "
+            "kernels and understates JAX throughput ~2x at large batch on RTX 5080."
+        ),
+    )
     parser.add_argument(
         "--include-torchure",
         action=argparse.BooleanOptionalAction,
