@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 # SMPL-X (PyTorch) vs SMPL-JAX comparison GIF. Same model file, same motion,
-# same settings (full forward, num_betas 10, expr 10, flat hands). torch needs
-# CUDA 13 NVRTC; JAX ships CUDA 12 — keep them on separate LD_LIBRARY_PATHs
-# and run as subprocesses.
+# same settings (full forward, num_betas 10, expr 10, flat hands).
 #
 # Fair comparison: both sides pose the identical batch (BENCH_BATCH, default
 # 2048) with the identical timing protocol (WARMUP untimed + median of REPEATS)
@@ -12,22 +10,14 @@
 # TF32 tensor-core mode (~1 mm max vertex delta vs the fp64 reference), and
 # the GIF banner discloses both precisions. For matched full-fp32 arithmetic
 # (sub-um agreement, lower JAX throughput) set MATMUL_PRECISION=fp32.
-MATMUL_PRECISION=${MATMUL_PRECISION:-tf32}
+#
+# Paths and the interpreter are resolved in _env.sh; see it for the knobs.
 set -euo pipefail
-REPO=/home/bozcomlekci/Desktop/projects/SMPL-JAX
-PY=/home/bozcomlekci/miniforge3/envs/body/bin/python
-CR=$REPO/tools/compare_render
-TORCH_CUDA_LIBS=/home/bozcomlekci/miniforge3/envs/body/lib/python3.10/site-packages/nvidia/cu13/lib
+source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
+
 OUT=${OUT:-/tmp/smpl_compare}
 GIF=${GIF:-$REPO/assets/teaser.gif}
-BENCH_BATCH=${BENCH_BATCH:-2048}
-WARMUP=${WARMUP:-10}
-REPEATS=${REPEATS:-50}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 mkdir -p "$OUT"
-
-# Real SOMA-dataset SMPL-X mocap clip (override with SEQ=...).
-SEQ=${SEQ:-$REPO/datasets/SOMA/soma_subject1/dance_001_stageii.npz}
 
 echo "==> generate shared motion (clip: $(basename "$SEQ"))"
 env -u LD_LIBRARY_PATH "$PY" "$CR/gen_motion.py" \

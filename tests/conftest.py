@@ -5,11 +5,19 @@ All fixtures build synthetic (random) model data so that tests can run
 without downloading the actual SMPL / SMPL-X .pkl files.
 """
 
+import jax
 import numpy as np
 import pytest
 
 from smpl_jax.smpl import SMPLModel
 from smpl_jax.smplx import SMPLXModel
+
+# On GPU, JAX defaults to TF32 tensor-core matmuls, which carry ~1e-3 error at
+# body scale — well above the 1e-5 tolerances the suite asserts against the
+# float64 PyTorch reference. Pin full float32 so the same tolerances hold on
+# every backend. This is a test-only setting; the library keeps the framework
+# default at run time (see the TF32 discussion in tools/compare_render/run.sh).
+jax.config.update("jax_default_matmul_precision", "highest")
 
 
 def _make_smpl_data(V: int = 100, J: int = 24, num_betas: int = 10) -> dict:

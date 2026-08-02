@@ -14,7 +14,7 @@ Parameter / output containers (JAX pytrees):
 Pose representations:
     axis_angle_to_rotmat    — Rodrigues' formula
     rotmat_to_axis_angle    — inverse via SVD / atan2
-    rotmat_to_6d            — first two columns
+    rotmat_to_6d            — first two rows (pytorch3d / SOMA-X convention)
     rotation_6d_to_rotmat   — Gram-Schmidt
 
 Inverse kinematics:

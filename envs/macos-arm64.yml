@@ -1,4 +1,14 @@
-name: ml
+# macOS / Apple Silicon (osx-arm64), jax-metal backend.
+#
+# Reproduces benchmarks/results/cpu/benchmark_m4_*.json (Apple M4).
+#
+#   conda env create -f envs/macos-arm64.yml
+#   conda activate smpl-jax-macos
+#
+# Full snapshot of a working environment, so the conda build strings are
+# osx-arm64 specific and will not solve on Linux — use envs/linux-cuda.yml
+# there. See envs/README.md.
+name: smpl-jax-macos
 channels:
   - defaults
 dependencies:
@@ -115,4 +125,3 @@ dependencies:
       - wcwidth==0.6.0
       - werkzeug==3.1.8
       - zipp==3.23.1
-prefix: /opt/miniconda3/envs/ml

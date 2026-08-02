@@ -1,0 +1,63 @@
+# Linux + NVIDIA CUDA. Reproduces benchmarks/results/rtx5080/*.json.
+#
+#   conda env create -f envs/linux-cuda.yml
+#   conda activate smpl-jax-cuda
+#   pip install -e .                        # this package, editable
+#
+# Curated rather than `conda env export`ed: pins are the versions the published
+# RTX 5080 runs were measured with, but only for packages this project actually
+# uses. The CUDA runtime wheels are deliberately left unpinned — torch and the
+# JAX plugin each pull the ones they need (see the note on CUDA majors below,
+# and envs/README.md).
+name: smpl-jax-cuda
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10.20
+  - pip
+  - pip:
+      # --- the library itself ---
+      - numpy==1.26.4
+      - optax==0.2.8
+      - jax==0.6.2
+      - jaxlib==0.6.2
+      # JAX on GPU: CUDA 12 plugin wheels.
+      - jax-cuda12-pjrt==0.6.2
+      - jax-cuda12-plugin==0.6.2
+      - ml_dtypes==0.5.4
+      - opt_einsum==3.4.0
+      - absl-py==2.4.0
+
+      # --- tests (.[dev]) ---
+      - pytest==9.0.3
+
+      # --- reference implementations (.[reference]) ---
+      # torch ships its own CUDA 13 runtime wheels; that is intentional and is
+      # why the render pipeline separates LD_LIBRARY_PATH per stage.
+      - torch==2.11.0
+      - smplx==0.1.28
+      - scipy==1.15.3
+      - chumpy @ git+https://github.com/hassony2/chumpy.git@c0118792626e7e18f485b115983e3f87f287517a
+      - smplpytorch @ git+https://github.com/gulvarol/smplpytorch.git@a18b0197d8a7204865b2ec95307e2286533f9487
+
+      # --- benchmark plots (.[plots]) ---
+      - matplotlib==3.10.8
+      - pandas==2.3.3
+      - plotly==6.7.0
+
+      # --- comparison renders (.[render]) ---
+      - pyrender==0.1.45
+      - trimesh==4.12.2
+      - pillow==12.1.1
+      - PyOpenGL==3.1.0
+      - networkx==3.4.2
+      - freetype-py==2.5.1
+      - tqdm==4.67.3
+
+# sxyu/smplxpp is a git submodule and must be built against your local CUDA
+# toolchain, so it cannot be pinned here. After creating the environment:
+#
+#   git submodule update --init --recursive third_party/smplxpp
+#   bash third_party/scripts/rebuild_smplxpp_cuda.sh
+#
+# Hydran00/torchure_smplx is built the same way; see third_party/scripts/README.md.

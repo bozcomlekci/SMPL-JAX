@@ -64,23 +64,35 @@ in radians.
 smpl_jax/
 ├── __init__.py          public API surface
 ├── types.py             SMPLParams, SMPLXParams, SMPLOutput, SMPLXOutput
-├── model_io.py          .pkl loader (normalises all known file variants)
+├── model_io.py          .pkl / .npz loader (normalises all known file variants)
 ├── _base.py             _SMPLBase — shared 7-step LBS forward pass
 ├── smpl.py              SMPLModel  (inherits _SMPLBase)
 ├── smplx.py             SMPLXModel (inherits _SMPLBase)
 ├── rotations.py         axis-angle ↔ rotmat ↔ 6D, safe_normalize
 ├── blend_shapes.py      shape / expression / pose blend shapes
 ├── kinematics.py        FK via jax.lax.scan
-└── lbs.py               lbs_transforms, lbs (compact 3×4 format)
+├── lbs.py               lbs_transforms, lbs (compact 3×4 format)
+├── inverse_lbs.py       pose recovery from a posed mesh
+└── py.typed             PEP 561 marker — the package ships type information
 
 tests/
-├── conftest.py          synthetic model fixtures (no .pkl files needed)
+├── conftest.py                      synthetic model fixtures (no .pkl needed);
+│                                    pins matmul precision to "highest"
 ├── test_rotations.py
 ├── test_blend_shapes.py
 ├── test_kinematics.py
 ├── test_forward.py
-└── test_inverse_lbs.py
+├── test_inverse_lbs.py
+├── test_model_io.py                 loader normalisation across file variants
+└── test_smplx_reference_parity.py   numerical parity vs the PyTorch smplx
+                                     package (skips without torch/smplx/weights)
 ```
+
+Everything outside `smpl_jax/` and `tests/` is supporting material and is not
+imported by the library: `examples/` (runnable demo), `benchmarks/` (throughput
+harness and plots), `tools/compare_render/` (teaser GIF pipeline), and
+`third_party/` (baseline implementations as submodules). Each has its own
+README.
 
 ---
 
@@ -159,11 +171,11 @@ class SMPLXParams(NamedTuple):
 
 ---
 
-### `model_io.py` — Loading `.pkl` files
+### `model_io.py` — Loading `.pkl` / `.npz` files
 
-`load_model_data(path)` reads a SMPL or SMPL-X `.pkl` file and returns a
-normalised `dict` of `numpy` arrays regardless of which model version produced
-the file.
+`load_model_data(path)` reads a SMPL or SMPL-X model file — pickle or NumPy
+archive — and returns a normalised `dict` of `numpy` arrays regardless of which
+model version produced the file.
 
 Handled variations:
 
@@ -172,7 +184,14 @@ Handled variations:
 | `shapedirs` | `(V*3, K)` or `(V, 3, K)` | `(V, 3, K)` |
 | `posedirs` | `(V, 3, P)`, `(V*3, P)`, or `(P, V*3)` | `(V*3, P)` |
 | `J_regressor` | dense `(J, V)` or `scipy.sparse` | dense `(J, V)` float32 |
-| `exprdirs` | key `"expr_dirs"` or `"exprdirs"` | `(V, 3, E)` or `None` |
+| `exprdirs` | key `"expr_dirs"` / `"exprdirs"`, or packed into `shapedirs` | `(V, 3, E)` or `None` |
+| `hands_meanl` / `hands_meanr` | `(45,)` | `(45,)` or `None` |
+
+**Packed SMPL-X basis.** Official SMPL-X files carry no `expr_dirs` key — they
+concatenate both bases into one `shapedirs` block of 400 columns (300 identity
++ 100 expression). When `shapedirs` is wider than 300 columns and no explicit
+expression key is present, the loader splits it. Narrower bases (SMPL, SMPL-H)
+are left untouched.
 
 All float arrays are cast to `float32`; index arrays to `int32`.
 
@@ -257,7 +276,7 @@ near-identity matrices via a zero-threshold guard.
 
 #### `rotmat_to_6d(R)` — `(..., 3, 3) → (..., 6)`
 
-Returns the first two columns of `R` (Zhou et al., 2019).  The six values
+Returns the first two rows of `R` (Zhou et al., 2019; pytorch3d / SOMA-X convention).  The six values
 uniquely determine `R` up to SO(3) and form a topologically correct continuous
 parameterisation — unlike axis-angle or quaternions, which have discontinuities.
 

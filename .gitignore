@@ -1,12 +1,57 @@
+# ---- Python ----
 __pycache__/
 *.py[cod]
+*$py.class
+*.so
 *.egg-info/
+*.egg
+.eggs/
 dist/
 build/
-.eggs/
-*.egg
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+ENV/
+.conda/
+.python-version
+
+# ---- Tooling caches ----
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+.ipynb_checkpoints/
+
+# ---- Editors / OS ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ---- Model weights and datasets ----
+# Licensed separately by MPI-IS and never committed. Download SMPL / SMPL-X
+# weights from https://smpl-x.is.tue.mpg.de/ into data/ (see README).
 data/
 smpl_models/
 datasets/
-.pytest_cache/
+# Safety net so licensed weights cannot be committed from an unexpected path.
+# Force-add with `git add -f` if you ever need to track a small fixture.
+*.pkl
+*.npz
+
+# ---- Run artifacts ----
 benchmarks/logs/
+*.log
+*.bak
+
+# ---- Third-party build trees ----
+third_party/*/build/
+third_party/*/dist/

@@ -9,17 +9,88 @@ description = "Fully differentiable, JIT-compiled SMPL and SMPL-X in JAX"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
+authors = [{ name = "Batuhan Ozcomlekci" }]
+keywords = [
+    "smpl",
+    "smplx",
+    "jax",
+    "human-body-model",
+    "linear-blend-skinning",
+    "differentiable-rendering",
+    "computer-vision",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Typing :: Typed",
+]
 dependencies = [
     "jax>=0.4.30",
     "optax>=0.1.7",
     "numpy>=1.24",
 ]
 
+[project.urls]
+Homepage = "https://github.com/bozcomlekci/SMPL-JAX"
+Repository = "https://github.com/bozcomlekci/SMPL-JAX"
+Issues = "https://github.com/bozcomlekci/SMPL-JAX/issues"
+Architecture = "https://github.com/bozcomlekci/SMPL-JAX/blob/main/ARCHITECTURE.md"
+Environments = "https://github.com/bozcomlekci/SMPL-JAX/tree/main/envs"
+
+# Extras are scoped to one task each, so no task drags in another's heavy
+# dependencies (regenerating a plot should not install a 3D renderer). The
+# library itself needs none of them.
 [project.optional-dependencies]
+# tests/
 dev = [
     "pytest>=7.0",
+]
+# benchmarks/plot_figures.py (matplotlib, pandas) and
+# benchmarks/plot_benchmark_results.py (pandas, plotly).
+plots = [
+    "matplotlib>=3.7",
+    "pandas>=2.0",
+    "plotly>=5.0",
+]
+# examples/pose_sequence.py — matplotlib for frame mode, open3d for sequence mode.
+examples = [
+    "matplotlib>=3.7",
+    "open3d>=0.17",
+]
+# tools/compare_render/ — offscreen pyrender pipeline; Pillow writes the GIFs.
+render = [
+    "pyrender>=0.1.45",
+    "trimesh>=4.0",
+    "pillow>=10.0",
+    "PyOpenGL>=3.1",
+]
+# Reference implementations used by tests/test_smplx_reference_parity.py and by
+# the cross-implementation benchmarks. Not needed to use the library.
+reference = [
+    "torch>=2.0",
+    "smplx>=0.1.28",
+]
+all = [
+    "smpl-jax[dev,plots,examples,render,reference]",
 ]
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["smpl_jax*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    # chumpy (a transitive dep of the reference smplx package) is unmaintained
+    # and trips deprecation warnings on modern numpy/scipy.
+    "ignore::DeprecationWarning:scipy.*",
+    "ignore::FutureWarning:chumpy.*",
+]

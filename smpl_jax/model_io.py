@@ -1,5 +1,5 @@
 """
-Model loading utilities for SMPL and SMPL-X .pkl files.
+Model loading utilities for SMPL and SMPL-X model files (.pkl and .npz).
 
 Normalises the various array shapes found in different model versions into a
 single, consistent dict that the model constructors can consume.
@@ -12,8 +12,28 @@ import pickle
 import numpy as np
 
 
+# Official SMPL-X files ship shape and expression blend shapes concatenated
+# into a single `shapedirs` block: the first 300 columns are the identity
+# (beta) basis and everything after is the expression basis.  There is no
+# `expr_dirs` key in those files, so the split has to be applied on load.
+_SMPLX_SHAPE_COMPONENTS = 300
+
+
+def _read_raw(path: str):
+    """Read a model file as either a pickle or an .npz archive."""
+    if path.lower().endswith(".npz"):
+        with np.load(path, allow_pickle=True) as npz:
+            return {k: npz[k] for k in npz.files}
+    try:
+        with open(path, "rb") as f:
+            return pickle.load(f, encoding="latin1")
+    except (pickle.UnpicklingError, UnicodeDecodeError):
+        with np.load(path, allow_pickle=True) as npz:
+            return {k: npz[k] for k in npz.files}
+
+
 def load_model_data(path: str) -> dict:
-    """Load a SMPL or SMPL-X .pkl file and return standardised numpy arrays.
+    """Load a SMPL or SMPL-X model file and return standardised numpy arrays.
 
     The returned dict contains:
         v_template   (V, 3)          float32
@@ -24,9 +44,10 @@ def load_model_data(path: str) -> dict:
         weights      (V, J)          float32
         faces        (F, 3)          int32
         exprdirs     (V, 3, E)       float32   or None (SMPL-X only)
+        hands_meanl  (45,)           float32   or None (SMPL-X / SMPL-H only)
+        hands_meanr  (45,)           float32   or None
     """
-    with open(path, "rb") as f:
-        raw = pickle.load(f, encoding="latin1")
+    raw = _read_raw(path)
 
     def get(key, default=None):
         if isinstance(raw, dict):
@@ -86,6 +107,15 @@ def load_model_data(path: str) -> dict:
         if exprdirs.ndim == 2:
             exprdirs = exprdirs.reshape(V, 3, -1)
         # exprdirs is now (V, 3, E)
+    elif shapedirs.shape[-1] > _SMPLX_SHAPE_COMPONENTS:
+        # Official SMPL-X layout: split the packed basis into shape + expression.
+        exprdirs = shapedirs[..., _SMPLX_SHAPE_COMPONENTS:]
+        shapedirs = shapedirs[..., :_SMPLX_SHAPE_COMPONENTS]
+
+    # ---- MANO hand pose means (SMPL-X / SMPL-H only) ------------------
+    def _hand_mean(key):
+        v = get(key)
+        return None if v is None else np.array(v, dtype=np.float32).reshape(-1)
 
     return dict(
         v_template=v_template,
@@ -96,4 +126,6 @@ def load_model_data(path: str) -> dict:
         weights=weights,
         faces=faces,
         exprdirs=exprdirs,
+        hands_meanl=_hand_mean("hands_meanl"),
+        hands_meanr=_hand_mean("hands_meanr"),
     )

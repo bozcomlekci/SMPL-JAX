@@ -57,6 +57,23 @@ class SMPLXModel(_SMPLBase):
         output  = forward(params)
         # output.vertices.shape == (8, 10475, 3)
         # output.joints.shape   == (8, 55, 3)
+
+    Hand-pose convention (``flat_hand_mean``):
+        SMPL-X model files ship a MANO mean hand pose (``hands_meanl`` /
+        ``hands_meanr``).  Two conventions exist for what a zero hand pose means:
+
+        * ``flat_hand_mean=True`` (default) — ``left_hand_pose`` is the absolute
+          axis-angle pose; zeros give a flat, open hand.  This is the convention
+          used by AMASS / SOMA ``*_stageii.npz`` sequences (whose ``pose_hand``
+          field is fed in directly) and by ``benchmarks/`` and
+          ``tools/compare_render/``, which pass ``flat_hand_mean=True`` to the
+          reference PyTorch ``smplx`` package.
+        * ``flat_hand_mean=False`` — the model's mean hand pose is added to
+          ``left_hand_pose`` / ``right_hand_pose``; zeros give the relaxed MANO
+          hand.  This is the PyTorch ``smplx`` package default.
+
+        The two differ by up to ~7.6 cm in vertex position, so the flag must
+        match whatever produced the pose parameters.
     """
 
     _output_cls = SMPLXOutput
@@ -77,6 +94,9 @@ class SMPLXModel(_SMPLBase):
         faces: np.ndarray,
         num_betas: int = 10,
         num_expression_coeffs: int = 10,
+        flat_hand_mean: bool = True,
+        hands_meanl: np.ndarray | None = None,
+        hands_meanr: np.ndarray | None = None,
     ) -> None:
         super().__init__(
             v_template=v_template,
@@ -93,19 +113,34 @@ class SMPLXModel(_SMPLBase):
             exprdirs[..., :num_expression_coeffs], dtype=jnp.float32
         )
 
+        # Hand-pose offset — see the class docstring for the convention.
+        self.flat_hand_mean = bool(flat_hand_mean)
+        if flat_hand_mean or hands_meanl is None:
+            mean_l = np.zeros(_NUM_HAND_JOINTS * 3, dtype=np.float32)
+        else:
+            mean_l = np.asarray(hands_meanl, dtype=np.float32).reshape(-1)
+        if flat_hand_mean or hands_meanr is None:
+            mean_r = np.zeros(_NUM_HAND_JOINTS * 3, dtype=np.float32)
+        else:
+            mean_r = np.asarray(hands_meanr, dtype=np.float32).reshape(-1)
+        self.hands_meanl = jnp.array(mean_l, dtype=jnp.float32)
+        self.hands_meanr = jnp.array(mean_r, dtype=jnp.float32)
+
     @classmethod
     def load(
         cls,
         path: str,
         num_betas: int = 10,
         num_expression_coeffs: int = 10,
+        flat_hand_mean: bool = True,
     ) -> SMPLXModel:
-        """Load an SMPL-X model from a .pkl file.
+        """Load an SMPL-X model from a .pkl or .npz file.
 
         Args:
-            path: path to SMPLX_NEUTRAL.pkl (or MALE / FEMALE).
+            path: path to SMPLX_NEUTRAL.{pkl,npz} (or MALE / FEMALE).
             num_betas: number of shape components to use (max in model).
             num_expression_coeffs: number of expression components to use.
+            flat_hand_mean: hand-pose convention; see the class docstring.
         """
         data = load_model_data(path)
         if data["exprdirs"] is None:
@@ -124,6 +159,9 @@ class SMPLXModel(_SMPLBase):
             faces=data["faces"],
             num_betas=num_betas,
             num_expression_coeffs=num_expression_coeffs,
+            flat_hand_mean=flat_hand_mean,
+            hands_meanl=data["hands_meanl"],
+            hands_meanr=data["hands_meanr"],
         )
 
     # ------------------------------------------------------------------
@@ -153,8 +191,13 @@ class SMPLXModel(_SMPLBase):
         R_reye  = jax.vmap(axis_angle_to_rotmat)(params.reye_pose)[:, None]       # (B,1,3,3)
         R_face  = jnp.concatenate([R_jaw, R_leye, R_reye], axis=1)                # (B,3,3,3)
 
-        R_lhand = aa_block(params.left_hand_pose,  _NUM_HAND_JOINTS)              # (B,15,3,3)
-        R_rhand = aa_block(params.right_hand_pose, _NUM_HAND_JOINTS)              # (B,15,3,3)
+        # Hand means are zero when flat_hand_mean=True (the default).
+        R_lhand = aa_block(
+            params.left_hand_pose + self.hands_meanl[None], _NUM_HAND_JOINTS
+        )                                                                         # (B,15,3,3)
+        R_rhand = aa_block(
+            params.right_hand_pose + self.hands_meanr[None], _NUM_HAND_JOINTS
+        )                                                                         # (B,15,3,3)
 
         # Joint order: root(0), body(1-21), face(22-24), lhand(25-39), rhand(40-54)
         R_all = jnp.concatenate(

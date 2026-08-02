@@ -4,24 +4,16 @@
 # cadence is slowed in proportion to its measured throughput (the fastest plays
 # every frame, slower methods advance fewer distinct poses per wall-clock second).
 #
-# torch/smplxpp need CUDA 13 NVRTC; JAX ships CUDA 12 — keep them on separate
-# LD_LIBRARY_PATHs and run as subprocesses. Each method poses BENCH_BATCH
-# (default 2048) with the identical timing protocol under its framework default.
+# Each method poses BENCH_BATCH (default 2048) with the identical timing
+# protocol under its framework default.
+#
+# Paths and the interpreter are resolved in _env.sh; see it for the knobs.
 set -euo pipefail
-REPO=/home/bozcomlekci/Desktop/projects/SMPL-JAX
-PY=/home/bozcomlekci/miniforge3/envs/body/bin/python
-CR=$REPO/tools/compare_render
-TORCH_CUDA_LIBS=/home/bozcomlekci/miniforge3/envs/body/lib/python3.10/site-packages/nvidia/cu13/lib
+source "$(dirname "${BASH_SOURCE[0]}")/_env.sh"
+
 OUT=${OUT:-/tmp/smpl_compare_multi}
 GIF=${GIF:-$REPO/assets/teaser_multi.gif}
-BENCH_BATCH=${BENCH_BATCH:-2048}
-WARMUP=${WARMUP:-10}
-REPEATS=${REPEATS:-50}
-MATMUL_PRECISION=${MATMUL_PRECISION:-tf32}
-export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
 mkdir -p "$OUT"
-
-SEQ=${SEQ:-$REPO/datasets/SOMA/soma_subject1/dance_001_stageii.npz}
 
 echo "==> generate shared motion (clip: $(basename "$SEQ"))"
 env -u LD_LIBRARY_PATH "$PY" "$CR/gen_motion.py" \

@@ -120,7 +120,9 @@ def rotmat_to_axis_angle(R: jnp.ndarray) -> jnp.ndarray:
 def rotmat_to_6d(R: jnp.ndarray) -> jnp.ndarray:
     """Rotation matrix → 6D continuous representation.
 
-    Extracts the first two columns of R.
+    Extracts the first two **rows** of R — the convention used by pytorch3d,
+    SOMA-X, and ``soma_jax``, so 6D parameters are interchangeable with them.
+    Inverse of :func:`rotation_6d_to_rotmat`.
 
     Args:
         R: (..., 3, 3) rotation matrices.
@@ -128,11 +130,15 @@ def rotmat_to_6d(R: jnp.ndarray) -> jnp.ndarray:
     Returns:
         (..., 6)
     """
-    return jnp.concatenate([R[..., :, 0], R[..., :, 1]], axis=-1)
+    return jnp.concatenate([R[..., 0, :], R[..., 1, :]], axis=-1)
 
 
 def rotation_6d_to_rotmat(r6d: jnp.ndarray) -> jnp.ndarray:
     """6D representation → rotation matrix via Gram-Schmidt.
+
+    The orthonormalized basis vectors become the **rows** of the result
+    (pytorch3d / SOMA-X convention). Stacking them as columns instead yields the
+    transposed — i.e. inverse — rotation.
 
     Args:
         r6d: (..., 6)
@@ -147,4 +153,4 @@ def rotation_6d_to_rotmat(r6d: jnp.ndarray) -> jnp.ndarray:
     b2 = safe_normalize(a2 - jnp.sum(b1 * a2, axis=-1, keepdims=True) * b1)
     b3 = jnp.cross(b1, b2)
 
-    return jnp.stack([b1, b2, b3], axis=-1)
+    return jnp.stack([b1, b2, b3], axis=-2)

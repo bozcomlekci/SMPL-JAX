@@ -1,3 +1,18 @@
+"""End-to-end SMPL-X posing from an AMASS / SOMA mocap clip.
+
+Loads one ``*_stageii.npz`` sequence plus a SMPL-X model file, poses either a
+single frame or the whole sequence, and visualises the result:
+
+    frame     matplotlib side-by-side of rest shape vs posed frame, saved to PNG
+    sequence  interactive Open3D animation of the posed mesh over the clip
+
+    python examples/pose_sequence.py --mode frame --frame 120
+    bash examples/pose_sequence.sh          # sequence mode with sane defaults
+
+Requires model weights in ``data/`` (see README) and ``matplotlib`` (frame mode)
+or ``open3d`` (sequence mode).
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -8,6 +23,9 @@ import jax.numpy as jnp
 import numpy as np
 
 from smpl_jax import SMPLXModel, SMPLXParams
+
+# Defaults resolve against the repo root so the script runs from any directory.
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _load_smplx_model(model_path: Path, num_betas: int, num_expression_coeffs: int) -> SMPLXModel:
@@ -396,13 +414,13 @@ def main() -> None:
     parser.add_argument(
         "--sequence",
         type=Path,
-        default=Path("datasets/SOMA/soma_subject1/walk_001_stageii.npz"),
-        help="Path to a SOMA stage-II sequence .npz",
+        default=REPO_ROOT / "datasets/SOMA/soma_subject1/walk_001_stageii.npz",
+        help="Path to an AMASS/SOMA stage-II sequence .npz",
     )
     parser.add_argument(
         "--model",
         type=Path,
-        default=Path("smpl_models/smplx/SMPLX_NEUTRAL.npz"),
+        default=REPO_ROOT / "data/smplx/SMPLX_NEUTRAL.npz",
         help="Path to SMPL-X model file (.npz or .pkl)",
     )
     parser.add_argument("--frame", type=int, default=0, help="Frame index to visualize (supports negative index)")
@@ -451,7 +469,7 @@ def main() -> None:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("assets/smplx_e2e_before_after.png"),
+        default=REPO_ROOT / "assets/smplx_e2e_before_after.png",
         help="Output image path (used in frame mode)",
     )
     args = parser.parse_args()
