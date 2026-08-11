@@ -173,15 +173,19 @@ def main():
         ib = _label(rb, lab_b, f"{cb} frames")
         frames.append(np.concatenate([ia, ib], axis=1))
 
-    # Final popup (held ~2 s): the relative speed increase. Disclose each
-    # side's matmul precision (framework defaults: JAX TF32 / torch FP32).
+    # Final popup (held ~2 s): the relative speed increase, with the matmul
+    # precision disclosed. When both sides ran the same precision — the fair
+    # case the drivers now default to — say so once rather than printing it
+    # twice, so a reader can see at a glance that the arithmetic matched.
     who = "SMPL-JAX" if fps_b >= fps_a else "SMPL-X"
     prec_a = str(A["precision"]) if "precision" in A else "?"
     prec_b = str(B["precision"]) if "precision" in B else "?"
+    prec = (f"both {prec_a}" if prec_a == prec_b
+            else f"JAX {prec_b} / torch {prec_a}")
     banner = _centered_banner(
         frames[-1].copy(), f"{who}  ~{ratio:.1f}x  faster",
         sub=f"same wall-clock  ·  {max(n_a, n_b)} vs {min(n_a, n_b)} frames  ·  "
-            f"full forward, batch {int(A['batch'])}  ·  JAX {prec_b} / torch {prec_a}")
+            f"full forward, batch {int(A['batch'])}  ·  {prec}")
     duration_s = float(A["duration_s"])
     play_fps = T / duration_s                          # realtime playback
     hold = int(round(2.0 * play_fps))

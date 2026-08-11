@@ -9,6 +9,18 @@ Two jobs:
      kernel-launch latency on both sides). Settings mirror
      benchmarks/benchmark_runtime.py: ``use_pca=False``, ``flat_hand_mean=True``,
      num_betas=10, num_expression_coeffs=10.
+
+Matmul precision (--matmul-precision)
+-------------------------------------
+Measured on an RTX 5080 at batch 2048, this reference implementation runs
+FASTER at tf32 than at fp32 (36.6 ms vs 39.2 ms, 1.07x), so tf32 is the
+baseline's best configuration and therefore the one a fair comparison pins BOTH
+sides to. Leaving the default at fp32 while SMPL-JAX ran tf32 flattered the JAX
+side by comparing different arithmetic.
+
+This switches ``torch.backends.cuda.matmul.allow_tf32``, a backend flag on
+torch itself. The vchoutas/smplx package is never modified — it is imported and
+called exactly as shipped.
 """
 from __future__ import annotations
 import argparse
@@ -28,11 +40,19 @@ def main():
                    help="untimed warmup iterations (excludes autotune/allocation)")
     p.add_argument("--repeats", type=int, default=50,
                    help="timed iterations; the median is reported")
+    p.add_argument("--matmul-precision", choices=["tf32", "fp32"], default="tf32",
+                   help="tf32 = torch's fastest on tensor-core GPUs (the fair "
+                        "comparison point); fp32 = torch's shipped default")
     p.add_argument("--out", required=True)
     args = p.parse_args()
 
     import torch
     import smplx
+
+    # Backend switch on torch, not a change to the smplx package.
+    use_tf32 = args.matmul_precision == "tf32"
+    torch.backends.cuda.matmul.allow_tf32 = use_tf32
+    torch.backends.cudnn.allow_tf32 = use_tf32
 
     m = np.load(args.motion, allow_pickle=True)
     T = m["trans"].shape[0]
@@ -103,14 +123,13 @@ def main():
     faces = model.faces.astype(np.int32)
     parents = model.parents.detach().cpu().numpy().astype(int)[:J].copy()
     parents[0] = 0
-    # torch's own default: allow_tf32=False -> full-fp32 GEMMs. The reference
-    # implementation is run untouched, exactly as shipped.
     np.savez(args.out, verts=verts, faces=faces, fps=fps, batch=B, bench_total_s=total,
              joints=joints, parents=parents,
              duration_s=float(m["duration_s"]), play_fps=float(m["play_fps"]),
-             label="SMPL-X (PyTorch)", precision="FP32")
+             label="SMPL-X (PyTorch)", precision=args.matmul_precision.upper())
     print(f"[smplx_torch] render T={T}  |  full-forward B={B} "
-          f"(warmup {args.warmup}, median of {args.repeats}): {total*1e3:.2f} ms "
+          f"(warmup {args.warmup}, median of {args.repeats}, "
+          f"{args.matmul_precision}): {total*1e3:.2f} ms "
           f"=> {fps:.0f} meshes/s  wrote {args.out}")
 
 

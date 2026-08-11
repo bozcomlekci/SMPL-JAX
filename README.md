@@ -17,9 +17,9 @@
 SMPL-JAX provides a clean, hardware-accelerated JAX port of the [SMPL](https://smpl.is.tue.mpg.de/) and [SMPL-X](https://smpl-x.is.tue.mpg.de/) parametric human body models. Every operation — shape blend shapes, forward kinematics, linear blend skinning, and pose inversion — is compatible with `jax.jit`, `jax.vmap`, and `jax.grad`, enabling large-scale batched fitting and differentiable optimization.
 
 <p align="center">
-  <img src="assets/teaser_multi.gif" width="800">
+  <img src="assets/teaser.gif" width="800" alt="SMPL-JAX and the reference PyTorch smplx posing the same SOMA mocap clip for the same wall-clock duration; SMPL-JAX advances 150 distinct poses to smplx's 54.">
   <br>
-  <em>Identical motion and settings posed by SMPL-JAX, <a href="https://github.com/vchoutas/smplx">vchoutas/smplx</a>, and <a href="https://github.com/sxyu/smplxpp">sxyu/smplxpp</a>; playback cadence is scaled to measured throughput.</em>
+  <em>Same clip, same batch, same timing protocol, <strong>same matmul precision</strong> — playback cadence scaled to measured throughput.</em>
 </p>
 
 ### Documentation
@@ -253,7 +253,22 @@ inverse_lbs(posed_verts, model)
 
 ## Benchmarks
 
-Full forward pass on an NVIDIA RTX 5080, float32, batch 2,048. Every implementation poses the same clip with the same timing protocol: untimed warmup, then the median of the timed runs.
+Full forward pass on an NVIDIA RTX 5080, batch 2,048. Every implementation poses the same clip with the same timing protocol: untimed warmup, then the median of the timed runs.
+
+### Head-to-head vs the reference `smplx`, at matched precision
+
+Matmul precision dominates this comparison, so both sides are always pinned to the same one:
+
+| Precision (both sides) | [vchoutas/smplx](https://github.com/vchoutas/smplx) | **SMPL-JAX** | Speedup | Vertex agreement |
+| ---------------------- | ------------ | ------------ | ------- | ---------------- |
+| **FP32** — full mantissa (default) | 52,094 FPS · 39.3 ms | **84,478 FPS · 24.2 ms** | **1.62×** | 0.001 mm max |
+| TF32 — tensor cores | 55,992 FPS · 36.6 ms | 155,480 FPS · 13.2 ms | 2.78× | 1.20 mm max |
+
+The headline number is the FP32 one: at full mantissa the two implementations agree to **one micrometre**, so the speedup rests on no numerical concession whatsoever.
+
+TF32 is reported too because it is JAX's out-of-the-box default and the regime most users will actually hit. It is not a handicap for the baseline — the reference `smplx` is itself 1.07× faster under TF32, and both implementations lose the same accuracy to it (0.81 mm each, measured against their own FP32 output). SMPL-JAX simply gains more from it: 1.85× vs 1.07×, for the reason explained below.
+
+Reproduce either row with `MATMUL_PRECISION=fp32|tf32 bash tools/compare_render/run.sh`, which pins both sides and prints these numbers.
 
 <p align="center">
   <picture>
@@ -262,7 +277,12 @@ Full forward pass on an NVIDIA RTX 5080, float32, batch 2,048. Every implementat
   </picture>
 </p>
 
-**Throughput at batch 2,048** — speedup is relative to the reference PyTorch `smplx`:
+### All implementations
+
+Widening to every implementation the harness can run. These rows come from a
+single `benchmark_runtime.py` sweep at framework defaults, which for the PyTorch
+side means FP32 — so they are **not** the matched-precision comparison above and
+should not be read as one:
 
 | Model  | Implementation                                                   | Throughput   | Mean runtime | vs `smplx` |
 | ------ | ---------------------------------------------------------------- | ------------ | ------------ | ---------- |
@@ -275,6 +295,15 @@ Full forward pass on an NVIDIA RTX 5080, float32, batch 2,048. Every implementat
 | SMPL-X | [vchoutas/smplx](https://github.com/vchoutas/smplx)               | 51,706 FPS   | 39.6 ms      | 1.00×      |
 | SMPL-X | [sxyu/smplxpp](https://github.com/sxyu/smplxpp)                   | 18,100 FPS   | 113.1 ms     | 0.35×      |
 
+> **Known issue — the SMPL-JAX rows in this table are pending re-measurement.**
+> The PyTorch, smplpytorch and smplxpp rows reproduce, but the SMPL-JAX SMPL-X
+> row (73,599 FPS) does not: re-running gives 154,380 FPS at the harness's own
+> defaults (TF32) or 84,162 FPS with `JAX_DEFAULT_MATMUL_PRECISION=highest`
+> (FP32), and the source run recorded no precision metadata. Trust the
+> matched-precision table above; this one is being regenerated once
+> `benchmark_runtime.py` gains the same explicit precision pinning that
+> `tools/compare_render/` now has.
+
 ### Scaling across batch size
 
 <p align="center">
@@ -284,7 +313,7 @@ Full forward pass on an NVIDIA RTX 5080, float32, batch 2,048. Every implementat
   </picture>
 </p>
 
-The advantage is a large-batch one. `jax.jit` + `jax.vmap` turn the whole forward pass into a single fused kernel, which is what pays off once there is enough work to fill the GPU — SMPL-JAX leads from batch 128 upward on both model families and holds roughly a 1.4–1.6× margin over the reference PyTorch `smplx` at the top of the sweep.
+The advantage is a large-batch one. `jax.jit` + `jax.vmap` turn the whole forward pass into a single fused kernel, which is what pays off once there is enough work to fill the GPU — SMPL-JAX leads from batch 128 upward on both model families. (Same caveat as the table: the SMPL-JAX curve is pending re-measurement at pinned precision; its shape is right, its absolute height is understated.)
 
 At batch sizes below ~32 the picture inverts: the C++ `smplxpp` is several times faster, because at that size the run is dominated by per-call launch overhead rather than arithmetic, and a native C++ path pays less of it. If your workload poses a handful of bodies at a time, that is the regime you are in.
 
