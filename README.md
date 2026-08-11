@@ -8,18 +8,18 @@
 [![JAX](https://img.shields.io/badge/backend-JAX-orange.svg)](https://github.com/google/jax)
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="benchmarks/figures/runtime_by_model_batch2048_dark.png">
-    <img src="benchmarks/figures/runtime_by_model_batch2048.png" width="820" alt="Mean runtime per forward pass at batch 2,048 on an RTX 5080. SMPL-X: SMPL-JAX 27.8 ms, vchoutas/smplx 39.6 ms, sxyu/smplxpp 113.1 ms. SMPL: SMPL-JAX 13.9 ms, gulvarol/smplpytorch 19.6 ms, vchoutas/smplx 21.6 ms, sxyu/smplxpp 53.0 ms, Hydran00/torchure_smplx 104.0 ms.">
-  </picture>
+  <img src="assets/teaser.gif" width="800" alt="SMPL-JAX and the reference PyTorch smplx posing the same SOMA mocap clip for the same wall-clock duration; SMPL-JAX advances 150 distinct poses to smplx's 54.">
+  <br>
+  <em>Same clip, same batch, same timing protocol, <strong>same matmul precision</strong> — playback cadence scaled to measured throughput.</em>
 </p>
 
 SMPL-JAX provides a clean, hardware-accelerated JAX port of the [SMPL](https://smpl.is.tue.mpg.de/) and [SMPL-X](https://smpl-x.is.tue.mpg.de/) parametric human body models. Every operation — shape blend shapes, forward kinematics, linear blend skinning, and pose inversion — is compatible with `jax.jit`, `jax.vmap`, and `jax.grad`, enabling large-scale batched fitting and differentiable optimization.
 
 <p align="center">
-  <img src="assets/teaser.gif" width="800" alt="SMPL-JAX and the reference PyTorch smplx posing the same SOMA mocap clip for the same wall-clock duration; SMPL-JAX advances 150 distinct poses to smplx's 54.">
-  <br>
-  <em>Same clip, same batch, same timing protocol, <strong>same matmul precision</strong> — playback cadence scaled to measured throughput.</em>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="benchmarks/figures/runtime_by_model_batch2048_dark.png">
+    <img src="benchmarks/figures/runtime_by_model_batch2048.png" width="820" alt="Mean runtime per forward pass at batch 2,048 on an RTX 5080. SMPL-X: SMPL-JAX 27.8 ms, vchoutas/smplx 39.6 ms, sxyu/smplxpp 113.1 ms. SMPL: SMPL-JAX 13.9 ms, gulvarol/smplpytorch 19.6 ms, vchoutas/smplx 21.6 ms, sxyu/smplxpp 53.0 ms, Hydran00/torchure_smplx 104.0 ms.">
+  </picture>
 </p>
 
 ### Documentation
